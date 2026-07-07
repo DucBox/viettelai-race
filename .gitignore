@@ -19,6 +19,12 @@ bench/.venv/
 artifacts/
 **/artifacts/
 
+# Original competition trace (provided by organizers) — not tracked in git.
+# Only the converted AIPerf replay input (data/*.aiperf.jsonl) is committed,
+# since that's the file the bench actually fires requests from.
+data/trace-round1.jsonl
+data/trace-round1.short.jsonl
+
 # serve_up.sh native-mode runtime state
 serve/.vllm.pid
 serve/vllm.log

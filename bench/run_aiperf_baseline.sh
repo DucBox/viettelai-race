@@ -6,9 +6,13 @@
 #   source bench/.venv/bin/activate
 #   ./bench/run_aiperf_baseline.sh              # light smoke run
 #   MODE=trace    ./bench/run_aiperf_baseline.sh   # flat shape approximation (no shared prefix)
-#   MODE=sessions ./bench/run_aiperf_baseline.sh   # REAL 20-user x 6-turn structure, growing
-#                                                   # shared context — this is what actually
-#                                                   # exercises prefix caching (Axis 1).
+#   MODE=sessions ./bench/run_aiperf_baseline.sh   # SYNTHETIC 20-user x 6-turn approximation
+#                                                   # (word-salad content, growing shared prefix).
+#   MODE=replay   ./bench/run_aiperf_baseline.sh   # THE REAL TRACE: replays data/trace-round1.jsonl
+#                                                   # (actual competition requests) verbatim on the
+#                                                   # trace's own fixed timestamp schedule. This is
+#                                                   # the faithful benchmark — no synthetic content.
+#                                                   # Run bench/convert_trace_to_aiperf.py first.
 #
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -27,6 +31,47 @@ case "$_MODEL_DIR" in
 esac
 TOKENIZER="$_MODEL_DIR"
 MODE="${MODE:-smoke}"
+
+if [[ "$MODE" == "replay" ]]; then
+  # THE REAL BENCHMARK. Replay the actual competition trace verbatim: each of the
+  # 120 records is a complete request (full conversation history baked in) that
+  # AIPerf fires at its own timestamp_ms via --fixed-schedule. No synthetic
+  # content, no --concurrency (the trace's timestamps drive the arrival pattern
+  # and thus the natural concurrency). max_tokens/temperature/seed travel inside
+  # the converted file, so we don't force them here (and deliberately no
+  # ignore_eos — the model stops at its real EOS, which is what gets scored).
+  TRACE_IN="${TRACE_IN:-data/trace-round1.jsonl}"
+  REPLAY_FILE="${REPLAY_FILE:-data/trace-round1.aiperf.jsonl}"
+
+  if [[ ! -f "$REPLAY_FILE" || "$TRACE_IN" -nt "$REPLAY_FILE" ]]; then
+    echo ">> converting $TRACE_IN -> $REPLAY_FILE (AIPerf mooncake_trace format)"
+    python3 bench/convert_trace_to_aiperf.py "$TRACE_IN" "$REPLAY_FILE"
+    echo
+  fi
+
+  echo ">> AIPerf [replay]  file=$REPLAY_FILE  (fixed-schedule, real trace content)"
+  echo ">> target: $URL  model: $MODEL"
+  echo
+
+  aiperf profile \
+    --model "$MODEL" \
+    --url "$URL" \
+    --endpoint-type chat \
+    --endpoint /v1/chat/completions \
+    --streaming \
+    --tokenizer "$TOKENIZER" \
+    --input-file "$REPLAY_FILE" \
+    --custom-dataset-type mooncake_trace \
+    --fixed-schedule \
+    --server-metrics-formats json csv jsonl \
+    --random-seed 42
+
+  echo
+  echo ">> Per-request breakdown (TTFT, TPOT, KV cache %, prefix cache) — run:"
+  echo "     ./.venv/bin/python scripts/07_per_request_report.py"
+  echo ">> (uses the most recent ./artifacts/*/profile_export.jsonl + server_metrics_export.jsonl)"
+  exit 0
+fi
 
 if [[ "$MODE" == "sessions" ]]; then
   # The REAL structure: 20 concurrent multi-turn sessions, 6 turns each, each
@@ -128,7 +173,5 @@ aiperf profile \
 
 echo
 echo ">> Client report + server_metrics_export.* saved under ./artifacts/ (AIPerf default)."
-echo ">> Later, to replay the REAL competition trace by timestamp, use:"
-echo "     aiperf profile --model $MODEL --url $URL --endpoint-type chat --streaming \\"
-echo "       --tokenizer $TOKENIZER \\"
-echo "       --input-file trace-round1.jsonl --custom-dataset-type mooncake_trace --fixed-schedule"
+echo ">> To benchmark the REAL competition trace (verbatim requests, fixed schedule):"
+echo "     MODE=replay ./bench/run_aiperf_baseline.sh"
