@@ -1,0 +1,25 @@
+# Local secrets
+serve/.env
+
+# Local Claude Code tool state (per-machine, not project source)
+.claude/
+
+# Model weights — never commit; place manually, see serve/models/README.md
+serve/models/*/
+!serve/models/README.md
+
+# Vendored AIPerf clone (external dependency, not this project's source)
+/aiperf/
+
+# venvs
+.venv/
+bench/.venv/
+
+# AIPerf outputs
+artifacts/
+**/artifacts/
+
+# misc
+.DS_Store
+__pycache__/
+*.pyc

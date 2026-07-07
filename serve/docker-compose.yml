@@ -1,0 +1,56 @@
+# vLLM serving stack for Viettel AI Race — Track 3 (baseline / flow-verify).
+#
+# Single service: vllm → OpenAI-compatible inference server + /metrics.
+# AIPerf drives load AND auto-scrapes /metrics, so no Prometheus/Grafana needed.
+#
+# Model weights are NOT downloaded by this stack — serve/models/<name>/ must
+# already exist (run ../scripts/01_check_model.sh to verify). The container is
+# fully offline (HF_HUB_OFFLINE=1): it serves the local path directly, never
+# pulls from the network, matching the competition's anti-cheat rule.
+#
+# Usage on the GPU box:
+#   cp .env.example .env          # then edit — set IMAGE + GPU_ID for this host
+#   ../scripts/00_list_gpus.sh    # see which of the host's GPUs are free
+#   ../scripts/01_check_model.sh  # verify the model dir is complete
+#   docker compose up -d vllm
+#
+# Requires: NVIDIA GPU + nvidia-container-toolkit installed on the host.
+# On a multi-GPU host, GPU_ID pins the container to exactly ONE physical card
+# (device_ids below) — the other cards stay untouched for other jobs.
+
+services:
+  vllm:
+    image: ${IMAGE:-vllm/vllm-openai:v0.22.1}   # override to your internal registry path
+    container_name: vllm-qwen35
+    ipc: host                               # vLLM needs large shared memory
+    ports:
+      - "8000:8000"                         # OpenAI API + /metrics live here
+    env_file: .env
+    environment:
+      - HF_HUB_OFFLINE=1                    # never touch the network for weights
+      - TRANSFORMERS_OFFLINE=1
+      - VLLM_LOGGING_LEVEL=INFO
+    volumes:
+      - ${MODEL_DIR:-./models/qwen3.5-2b}:${MODEL_PATH:-/models/qwen3.5-2b}:ro
+    # vllm/vllm-openai's entrypoint is `vllm serve`, so `command` is just its args.
+    # The positional arg is a local path, not a HF repo id — no download possible.
+    command: >
+      ${MODEL_PATH:-/models/qwen3.5-2b}
+      --served-model-name ${SERVED_MODEL_NAME:-qwen3.5-2b}
+      --max-model-len ${MAX_MODEL_LEN:-32768}
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
+      --max-num-seqs ${MAX_NUM_SEQS:-32}
+      --enable-prefix-caching
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40                           # first start includes model load
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_ID:-0}"]   # pin to ONE physical card on multi-GPU hosts
+              capabilities: [gpu]
