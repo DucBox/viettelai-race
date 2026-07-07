@@ -58,101 +58,60 @@ docs/
   qwen35-architecture.html    bilingual architecture deep-dive
 ```
 
-## Deploying on the internal server (multi-GPU, registry image, model already present)
+## Running it
 
-The common path once the model and this repo are already on the box:
+One runbook, two contexts — only the `.env` values differ:
 
-```bash
-git clone <this-repo-url> && cd viettelai-race
-cd serve && cp .env.example .env
-```
-Edit `serve/.env`:
-```bash
-IMAGE=registry.internal.example.com/team/vllm-openai:v0.22.1   # your internal image
-GPU_ID=0                                                         # defaults to card 0
-```
-`GPU_ID` pins the container to exactly **one** of the host's cards via
-`device_ids` in `docker-compose.yml` — the other 3 are left alone. Only touch
-it if card 0 happens to be busy (check with `./scripts/00_list_gpus.sh`).
-
-```bash
-cd ..
-./scripts/serve_up.sh
-```
-This verifies `serve/models/qwen3.5-2b/` is complete, brings the container up,
-and polls `/health` until vLLM is actually ready (first boot includes model
-load + CUDA graph compile, can take a few minutes).
-
-Then collect and view metrics with AIPerf — no request timing / 20-user trace
-yet, just confirm the serve→metrics loop works end-to-end:
-```bash
-./bench/install_aiperf.sh
-source bench/.venv/bin/activate
-./bench/run_aiperf_baseline.sh        # MODE=smoke (default): light synthetic traffic
-```
-Watch `./scripts/03_watch_metrics.sh` in another terminal at the same time for
-the server-side view (KV cache usage, request queue). AIPerf's own console
-table plus `./artifacts/**/server_metrics_export.*` give the client-side view.
-
-## Runbook (on a small dev GPU box)
+| | Small dev GPU (RTX 3060 / L4 / A10) | Internal multi-GPU server |
+|---|---|---|
+| `IMAGE` | default (Docker Hub `vllm/vllm-openai:v0.22.1`) | your internal registry path |
+| `GPU_ID` | default `0` (only card) | default `0` — override only if card 0 is busy (`./scripts/00_list_gpus.sh`) |
+| `MAX_MODEL_LEN` | `32768` (fits a small card) | same, unless the card has more headroom |
 
 ### 0. Prereqs
-- NVIDIA driver + `nvidia-container-toolkit` (so Docker can see the GPU:
-  `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi`)
-- `docker` + `docker compose`, Python 3.10+
-- The model weights already placed at `serve/models/qwen3.5-2b/` (see below)
+- NVIDIA driver + `nvidia-container-toolkit` (check: `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi`)
+- `docker` + `docker compose`
+- Model weights already placed at `serve/models/qwen3.5-2b/` (this repo never downloads them — see `serve/models/README.md`)
 
 ### 1. Configure
 ```bash
-cd serve
-cp .env.example .env
-# edit .env — on a small GPU keep MAX_MODEL_LEN=32768, GPU_MEM_UTIL≈0.90
+cd serve && cp .env.example .env
+# edit .env: set IMAGE if using your internal registry, GPU_ID if card 0 is busy
 cd ..
 ```
 
-### 2. Verify the model is complete (no download happens here)
+### 2. Serve
 ```bash
-./scripts/01_check_model.sh
+./scripts/serve_up.sh
 ```
-Exits with a clear list of missing files if the directory is incomplete — get the
-weights onto `serve/models/qwen3.5-2b/` however you normally would (rsync/scp from
-wherever they're cached) and re-run. See `serve/models/README.md` for the exact
-file list this model needs.
+One command: verifies `serve/models/qwen3.5-2b/` is complete (fails fast with an
+exact missing-file list if not), brings the container up pinned to `GPU_ID`, and
+polls `/health` until vLLM is actually ready (first boot includes model load +
+CUDA graph compile — can take a few minutes).
 
-### 3. Serve
-```bash
-cd serve
-docker compose up -d vllm               # just the server
-docker compose logs -f vllm             # watch it load; wait for "Application startup complete"
-```
-First boot loads the model + compiles CUDA graphs — give it a few minutes.
-Health: `curl -fsS localhost:8000/health` and `curl -fsS localhost:8000/v1/models`.
-
-### 4. Smoke test (does inference actually work?)
+### 3. Smoke test (does inference actually work?)
 ```bash
 ./scripts/02_smoke_test.sh
 ```
 Expect a real answer to the prefix-caching question. If you get one, the model is
 loaded, tokenizer is fine, streaming path is fine.
 
-### 5. See the metrics vLLM exposes
+### 4. See the metrics vLLM exposes
 ```bash
-./scripts/03_watch_metrics.sh           # refreshing view of /metrics in terminal 2
-# or open the raw feed once:
-curl -s localhost:8000/metrics | grep -E '^vllm:(kv_cache_usage_perc|num_requests_(running|waiting)|.*prefix_cache)'
+./scripts/03_watch_metrics.sh           # refreshing view of /metrics, in its own terminal
 ```
 
-### 6. Drive load + view the full report (AIPerf)
+### 5. Drive load + view the full report (AIPerf)
 ```bash
 ./bench/install_aiperf.sh
 source bench/.venv/bin/activate
 
-./bench/run_aiperf_baseline.sh          # quick smoke: concurrency 4, 20 reqs
+./bench/run_aiperf_baseline.sh          # smoke (default): concurrency 4, 20 reqs
 MODE=trace ./bench/run_aiperf_baseline.sh   # competition-shaped: 20 sessions, ~15k in / 200 out
 ```
-Watch `./scripts/03_watch_metrics.sh` in another terminal while this runs — you'll
-see `num_requests_running` jump to ~20 on the burst and `kv_cache_usage_perc` climb.
-AIPerf prints a TTFT / ITL / throughput table and writes everything (including
+Keep `./scripts/03_watch_metrics.sh` running in another terminal while this runs —
+you'll see `num_requests_running` jump and `kv_cache_usage_perc` climb. AIPerf
+prints a TTFT / ITL / throughput table and writes everything (including
 `server_metrics_export.*`) under `./artifacts/`.
 
 ## What to look at (mapped to the scoring)
