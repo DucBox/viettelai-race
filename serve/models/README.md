@@ -47,3 +47,30 @@ Then verify:
 ```bash
 ./scripts/01_check_model.sh
 ```
+
+## Using a different model directory name, or a different image
+
+Nothing here is hardcoded to `qwen3.5-2b` — both the model path and the vLLM
+image are just values in `serve/.env` (copy `serve/.env.example` first):
+
+```bash
+# serve/.env
+
+# If your weights live somewhere else / under a different name:
+MODEL_DIR=./models/my-other-model     # host path, relative to serve/ (or absolute)
+MODEL_PATH=/models/my-other-model     # path INSIDE the container — keep these two matching
+SERVED_MODEL_NAME=my-other-model      # name clients (AIPerf, curl) will request
+
+# If you're using an image from your own registry instead of Docker Hub:
+IMAGE=registry.internal.example.com/team/vllm-openai:v0.22.1
+```
+
+`docker-compose.yml` reads all four from `.env` — no edits to the compose file
+or to this repo's scripts are needed. `scripts/01_check_model.sh` also reads
+`MODEL_DIR` from `serve/.env`, so it checks whatever path you point it at.
+
+After changing `.env`, re-run:
+```bash
+./scripts/01_check_model.sh   # verifies the new MODEL_DIR
+./scripts/serve_up.sh         # brings up vLLM with the new IMAGE / model path
+```
