@@ -127,6 +127,24 @@ càng nhỏ; chú ý độ chính xác.
 
 ---
 
+## 3b. Bài học từ vLLM issues — prefix caching trên Qwen3.5 hybrid
+
+Prefix caching cho hybrid (Mamba/GDN + attention) trong vLLM đang **phát triển dở**;
+log của bạn xác nhận đang chạy **'align' mode (experimental)**. Ba issue đáng học:
+
+| Issue | Nội dung | Bài học cho mình |
+|---|---|---|
+| [#26201](https://github.com/vllm-project/vllm/issues/26201) (tracking) | Có 2 mode: **`all`** (cơ bản, đã chạy được) và **`align`** (tối ưu Marconi-style, còn dở — có perf issue + nghẽn CPU-GPU sync). Hybrid mặc định = `align`. | **A/B `--mamba-cache-mode all` vs `align`** — mode `all` có thể **ổn định/nhanh hơn** cho mình. Đây là lever cụ thể. |
+| [#43587](https://github.com/vllm-project/vllm/issues/43587) | Trên hybrid, request incremental (prefix tăng dần) trả **`num_cached_tokens=0` DÙ block hash khớp** → cache reuse **âm thầm hỏng**. (bug ở path multimodal, nhưng **đúng pattern multi-turn tăng dần** của trace mình) | **PHẢI verify hit% thật** bằng `cache_rd` (script 07) — **đừng tin** cache tự chạy đúng. Chính là lý do hạ tầng đo quan trọng. |
+| [#40696](https://github.com/vllm-project/vllm/issues/40696) | block-size ép ~528–544 (align Mamba page); chỉ cache **block hoàn chỉnh** → prompt <544 hit ~0%, hit rate dao động theo ranh giới block. | Prompt mình 13k+ nên OK; nhưng **đuôi prefix lẻ block không cache**. Thử `--mamba-block-size` nếu muốn tinh chỉnh. |
+
+**Kết:** prefix caching trên arch này **không đảm bảo tự chạy đúng** → phải verify bằng
+số đo (`cache_rd`/`hit%`), và có sẵn 2 lever để thử: **`--mamba-cache-mode`** (all/align)
+và **`--mamba-block-size`**. Nếu thấy `hit%≈0` dù prefix chung to → gần như chắc dính
+biến thể của bug #43587 → đổi sang `all` mode / chỉnh block-size.
+
+---
+
 ## 4. Checklist giải pháp (chỉ vLLM) — ánh xạ tới cờ
 
 > Ưu tiên theo đòn bẩy. Vì prefill-bound, nhóm B (tính nhanh) và A (cache) ăn điểm nhất.
@@ -243,6 +261,34 @@ recipe = QuantizationModifier(
 **Tác động ước lượng:** ~1.37B GEMM `*_proj` xuống FP8 → giải phóng ~1.3–2.2GB VRAM
 **và** tăng tốc GEMM prefill (đòn bẩy B — thắng round-1). `lm_head` 0.51B + vision
 0.33B vẫn BF16 (hoặc bỏ vision).
+
+---
+
+## 4c. FP8: chọn format, W8A8 vs W8A16, xử lý outlier
+
+### Format: dùng **E4M3**
+- **E4M3** (4 exp, 3 mantissa, range ±448) — **nhiều precision** → dùng cho **weight + activation**.
+- **E5M2** (5 exp, 2 mantissa) — nhiều range, ít precision → gradient (training) / KV cache.
+- **H200 (Hopper, tensor core gen 4)** và **L40S (Ada)** đều **native FP8** → GEMM FP8 chạy **~2× BF16**. Speedup FP8 **chỉ có thật khi** phần cứng có FP8 core **và** engine có FP8 kernel (cả hai đều có ✓). Thiếu 1 trong 2 → "FP8" chỉ là dequant → **chậm hơn** BF16.
+
+### W8A8 (bắt buộc) vs W8A16 (bẫy)
+| Scheme | Weight | Activation | Tăng tốc prefill? |
+|---|---|---|---|
+| **W8A16** (weight-only) | FP8 | BF16 | ❌ gần như không — matmul vẫn chạy BF16, chỉ tiết kiệm VRAM |
+| **W8A8** (full FP8) | FP8 | FP8 | ✅ có — matmul chạy thẳng trên FP8 core, ~2× |
+
+Prefill là **compute-bound** → muốn TTFT giảm thì **phép nhân ma trận phải chạy trên FP8 core** → **bắt buộc W8A8** (activation cũng FP8). Weight-only chỉ giúp bộ nhớ/decode, **TTFT gần như không đổi** — đúng thứ mình cần lại không được.
+
+### Outlier — FP8 tự lo phần lớn
+LLM có **outlier channel** (vài chiều activation biên độ cực lớn) — vấn đề kinh điển của INT8/INT4. Nhưng **FP8 là số dấu phẩy động** → có exponent → **dải động rộng hơn INT8 nhiều** → **nuốt outlier tốt**. Vì vậy FP8 thường **KHÔNG cần** SmoothQuant/AWQ (mấy kỹ thuật đó dành cho INT4/INT8).
+
+Với FP8, "xử lý outlier" gói gọn trong 3 thứ nhẹ:
+1. **Scale mịn**: per-channel cho weight + **dynamic per-token** cho activation → cô lập outlier vào scale riêng.
+2. **Giữ tensor nhạy ở BF16** (ignore-list §4b): `lm_head`, norm, `A_log`/`dt_bias`/`conv1d`, `in_proj_a/b`.
+3. **Không** SmoothQuant/AWQ (để dành cho INT4 nếu sau này cần).
+
+### Chốt
+**`FP8_DYNAMIC` (E4M3, per-channel weight + dynamic per-token activation, W8A8)** — data-free, tự chịu outlier, đúng recipe §4b. Đó là lý do FP8 quantize được **không cần calibrate**. Muốn vắt thêm accuracy (khi có harness): calibrate scale (per-tensor → per-head) bằng llm-compressor.
 
 ---
 
