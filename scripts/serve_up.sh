@@ -47,24 +47,39 @@ if [[ -n "$USE_COMPOSE" ]]; then
   LOGS_CMD="cd serve && ${COMPOSE[*]} logs -f vllm"
 else
   echo ">> No compose CLI found (v2 plugin or v1 binary) — using plain 'docker run' instead."
-  echo ">> Starting vLLM via docker run (GPU_ID=$GPU_ID) ..."
   docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
-  docker run -d \
-    --name vllm-qwen35 \
-    --ipc=host \
-    --gpus "\"device=$GPU_ID\"" \
-    -p 8000:8000 \
-    -e HF_HUB_OFFLINE=1 \
-    -e TRANSFORMERS_OFFLINE=1 \
-    -e VLLM_LOGGING_LEVEL=INFO \
-    -v "$MODEL_DIR_ABS:$MODEL_PATH:ro" \
-    "$IMAGE" \
-    "$MODEL_PATH" \
-    --served-model-name "$SERVED_MODEL_NAME" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --max-num-seqs "$MAX_NUM_SEQS" \
-    --enable-prefix-caching
+
+  RUN_COMMON=(-d --name vllm-qwen35 --ipc=host -p 8000:8000
+    -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO
+    -v "$MODEL_DIR_ABS:$MODEL_PATH:ro")
+  VLLM_ARGS=("$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
+    --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --max-num-seqs "$MAX_NUM_SEQS" --enable-prefix-caching)
+
+  # Attempt 1: modern `--gpus` flag (goes through CDI vendor discovery in
+  # recent Docker versions). This is known to fail with "failed to discover
+  # GPU vendor from CDI" on Docker-in-Docker / Kubernetes-pod hosts where no
+  # CDI spec (/etc/cdi/nvidia.yaml) has been generated, even though the host's
+  # own nvidia-smi works fine. If that happens, fall back to the classic
+  # --runtime=nvidia + NVIDIA_VISIBLE_DEVICES mechanism, which bypasses CDI.
+  echo ">> Attempt 1/2: docker run --gpus (GPU_ID=$GPU_ID, CDI-based discovery) ..."
+  GPU_ERR=""
+  if ! GPU_ERR="$(docker run "${RUN_COMMON[@]}" --gpus "\"device=$GPU_ID\"" "$IMAGE" "${VLLM_ARGS[@]}" 2>&1 >/dev/null)"; then
+    if echo "$GPU_ERR" | grep -qi "cdi\|gpu vendor"; then
+      echo ">> '--gpus' failed via CDI vendor discovery (common on Docker-in-Docker / k8s pods)."
+      echo ">> Attempt 2/2: classic --runtime=nvidia + NVIDIA_VISIBLE_DEVICES ..."
+      docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
+      docker run "${RUN_COMMON[@]}" \
+        --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES="$GPU_ID" \
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        "$IMAGE" "${VLLM_ARGS[@]}"
+    else
+      echo "!! docker run failed (not a CDI/GPU-vendor issue) — full error:"
+      echo "$GPU_ERR"
+      exit 1
+    fi
+  fi
   LOGS_CMD="docker logs -f vllm-qwen35"
 fi
 
