@@ -10,11 +10,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Detect which Compose CLI is available: v2 plugin (`docker compose`) or the
+# standalone v1 binary (`docker-compose`). Some minimal/managed Docker installs
+# (e.g. a bare vscode-server pod) ship only one of the two.
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "!! Neither 'docker compose' (v2 plugin) nor 'docker-compose' (v1) is available."
+  echo "   Install the Compose plugin: https://docs.docker.com/compose/install/linux/"
+  exit 1
+fi
+
 ./scripts/01_check_model.sh
 
 echo
-echo ">> Starting vLLM (serve/docker-compose.yml, GPU_ID=${GPU_ID:-0 (default)}) ..."
-( cd serve && docker compose up -d vllm )
+echo ">> Starting vLLM (serve/docker-compose.yml, GPU_ID=${GPU_ID:-0 (default)}) via '${COMPOSE[*]}' ..."
+( cd serve && "${COMPOSE[@]}" up -d vllm )
 
 echo ">> Waiting for /health to report ready (model load + CUDA graph compile can take a few minutes) ..."
 URL="http://localhost:8000"
@@ -32,5 +45,5 @@ for i in $(seq 1 120); do
 done
 
 echo "!! Not healthy after 10 minutes. Check logs:"
-echo "     cd serve && docker compose logs -f vllm"
+echo "     cd serve && ${COMPOSE[*]} logs -f vllm"
 exit 1
