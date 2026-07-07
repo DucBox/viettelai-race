@@ -92,6 +92,46 @@ def metric_val(sample, name):
     return entries[0].get("value")
 
 
+def compute_isl_map():
+    """Best-effort per-request input token counts (session_num -> ISL).
+
+    AIPerf does NOT tokenize the input in mooncake_trace `messages` mode, so
+    profile_export.jsonl has no input_sequence_length. We recover it by applying
+    the model's chat template to each converted-trace record — the same thing
+    vLLM does — which also surfaces the growing-prefix signal (ISL climbs each
+    turn). Requires transformers (present in bench/.venv) + the model dir; run
+    the report with ./bench/.venv/bin/python to enable it, else in_tok stays "-".
+
+    Paths (overridable via env): REPLAY_FILE (default data/trace-round1.aiperf.jsonl),
+    TOKENIZER / MODEL_DIR (default serve/models/qwen3.5-2b).
+    """
+    trace = os.environ.get("REPLAY_FILE", "data/trace-round1.aiperf.jsonl")
+    tok_dir = (os.environ.get("TOKENIZER") or os.environ.get("MODEL_DIR")
+               or "serve/models/qwen3.5-2b")
+    if not os.path.exists(trace) or not os.path.isdir(tok_dir):
+        return {}
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(tok_dir)
+    except Exception:
+        return {}
+    out = {}
+    try:
+        with open(trace) as f:
+            for i, line in enumerate(f):  # line index == session_num == request_id
+                line = line.strip()
+                if not line:
+                    continue
+                msgs = json.loads(line).get("messages")
+                if not msgs:
+                    continue
+                rendered = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+                out[i] = len(tok(rendered)["input_ids"])
+    except Exception:
+        return {}
+    return out
+
+
 def main():
     explicit_dir, users_cli = parse_args(sys.argv)
     run_dir = find_run_dir(explicit_dir)
@@ -116,8 +156,8 @@ def main():
         return server_samples[i]
 
     base = server_samples[0] if server_samples else None
-    base_hits = metric_val(base, "vllm:prefix_cache_hits_total") if base else None
-    base_queries = metric_val(base, "vllm:prefix_cache_queries_total") if base else None
+    base_hits = metric_val(base, "vllm:prefix_cache_hits") if base else None
+    base_queries = metric_val(base, "vllm:prefix_cache_queries") if base else None
 
     # --- decide (user, turn) mapping ---------------------------------------
     metas = [r.get("metadata", {}) for r in requests]
@@ -138,6 +178,9 @@ def main():
                 return None, None
             return sn % users, sn // users
         return sn, meta.get("turn_index")
+
+    # Recover per-request ISL from the tokenizer (AIPerf omits it in this mode).
+    isl_map = compute_isl_map() if is_replay else {}
 
     # run t0 = earliest credit_issued (fallback request_start) for relative ms
     starts = [m.get("credit_issued_ns") or m.get("request_start_ns")
@@ -174,17 +217,18 @@ def main():
             continue
 
         s = nearest_sample(end)
-        hits = metric_val(s, "vllm:prefix_cache_hits_total") if s else None
-        queries = metric_val(s, "vllm:prefix_cache_queries_total") if s else None
+        hits = metric_val(s, "vllm:prefix_cache_hits") if s else None
+        queries = metric_val(s, "vllm:prefix_cache_queries") if s else None
         rows.append({
             "user": user, "turn": turn, "req": meta.get("session_num"),
             "arr_ms": rel_ms(arr), "start_ms": rel_ms(start), "end_ms": rel_ms(end),
             "queue_ms": (rel_ms(start) - rel_ms(arr)) if (arr and start) else None,
             "ttft": mv("time_to_first_token"),
             "tpot": mv("inter_token_latency"),
-            # ISL from client-side tokenization when present, else the server's
-            # reported usage.prompt_tokens (populated on a real vLLM run).
-            "in_tok": first("input_sequence_length", "usage_prompt_tokens"),
+            # ISL: AIPerf's own value if it ever provides one, else the server's
+            # usage.prompt_tokens, else our tokenizer-computed count (this mode).
+            "in_tok": (first("input_sequence_length", "usage_prompt_tokens")
+                       or isl_map.get(meta.get("session_num"))),
             "out_tok": first("output_sequence_length", "output_token_count", "usage_completion_tokens"),
             "latency": mv("request_latency"),
             "gen_tps": mv("output_token_throughput_per_user"),
@@ -261,14 +305,14 @@ def main():
             w.writerow({c: row.get(c) for c in cols})
     print(f">> full per-request CSV (all columns): {csv_path}")
 
+    if is_replay and not any(r.get("in_tok") is not None for r in rows):
+        print("(in_tok blank: AIPerf omits ISL in this mode and it's recovered via the")
+        print(" tokenizer — run with ./bench/.venv/bin/python so transformers is available.)")
     if have_server:
         print()
         print("Note: KV%/run/Δhits/Δqueries are GLOBAL vLLM engine state at the nearest scrape")
         print("to each request's end (scraped ~every 333ms), shared across all concurrent")
         print("requests — not a per-request cache-hit flag (vLLM doesn't expose that).")
-    elif not server_samples:
-        print("(in_tok is blank when the server doesn't return prompt-token usage; a real vLLM")
-        print(" run populates it. Re-run with --server-metrics-formats ... jsonl for KV/prefix.)")
 
 
 if __name__ == "__main__":
