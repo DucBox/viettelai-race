@@ -55,7 +55,7 @@ scripts/
   07_per_request_report.py   per-user / per-turn table from AIPerf's raw output + full CSV
 bench/
   install_aiperf.sh    installs AIPerf from ../aiperf (vendored clone) or PyPI as fallback
-  run_aiperf_baseline.sh   drive load + print report (smoke | trace | sessions | replay)
+  run_aiperf_baseline.sh   drive load + print report (smoke | trace | replay)
   convert_trace_to_aiperf.py   convert the real trace to AIPerf's mooncake_trace format
 data/
   trace-round1.jsonl         real competition trace (organizer-provided, gitignored)
@@ -118,7 +118,6 @@ source bench/.venv/bin/activate
 
 ./bench/run_aiperf_baseline.sh              # smoke (default): concurrency 4, 20 reqs
 MODE=trace    ./bench/run_aiperf_baseline.sh   # competition-*shaped* synthetic: 20 conc, ~15k in / 200 out
-MODE=sessions ./bench/run_aiperf_baseline.sh   # synthetic 20-user x 6-turn (growing shared prefix)
 MODE=replay   ./bench/run_aiperf_baseline.sh   # THE REAL TRACE: replays data/trace-round1.jsonl
 ```
 `MODE=replay` is the faithful benchmark: it replays the actual 120 competition
