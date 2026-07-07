@@ -160,6 +160,92 @@ càng nhỏ; chú ý độ chính xác.
 
 ---
 
+## 4b. FP8 weight — kế hoạch chi tiết theo tensor (ignore-list)
+
+Đây là phần việc thật sự của FP8 (tốc độ FP8 đến từ hardware tensor core + kernel
+của engine, KHÔNG phải từ việc tự quantize): **chọn đúng tensor nào quantize, tensor
+nào giữ**. Nguyên tắc: chỉ FP8 các **ma
+trận GEMM lớn** (`*_proj`) — nơi tập trung FLOPs + bộ nhớ; **giữ nguyên** các tensor
+nhỏ/nhạy (norm, bias, gate, conv, tham số SSM, embedding/lm_head). Quantize mấy cái
+nhỏ gần như không tiết kiệm gì mà dễ làm **tụt accuracy → rơi khỏi cổng GPQA**.
+
+Kế hoạch dưới đây đọc từ header safetensors thật (xem `docs/qwen35-architecture.html`,
+mục Phụ lục tensor).
+
+### GDN layer (×18)
+| Tensor | Shape | Dtype | Kế hoạch |
+|---|---|---|---|
+| `linear_attn.in_proj_qkv` | [6144, 2048] | BF16 | **FP8** |
+| `linear_attn.in_proj_z` | [2048, 2048] | BF16 | **FP8** |
+| `linear_attn.out_proj` | [2048, 2048] | BF16 | **FP8** |
+| `mlp.{gate,up}_proj` | [6144, 2048] | BF16 | **FP8** |
+| `mlp.down_proj` | [2048, 6144] | BF16 | **FP8** |
+| `linear_attn.in_proj_a / _b` | [16, 2048] | BF16 | keep (nhỏ, cổng SSM) |
+| `linear_attn.conv1d.weight` | [6144, 1, 4] | BF16 | keep (short conv) |
+| `linear_attn.A_log` | [16] | F32 | keep fp32 (động lực hồi quy) |
+| `linear_attn.dt_bias` | [16] | BF16 | keep |
+| `linear_attn.norm.weight` | [128] | F32 | keep fp32 |
+| `input / post_attention_layernorm` | [2048] | BF16 | keep |
+
+### Full-attention layer (×6)
+| Tensor | Shape | Dtype | Kế hoạch |
+|---|---|---|---|
+| `self_attn.q_proj` | [4096, 2048] | BF16 | **FP8** |
+| `self_attn.{k,v}_proj` | [512, 2048] | BF16 | **FP8** |
+| `self_attn.o_proj` | [2048, 2048] | BF16 | **FP8** |
+| `self_attn.{q,k}_norm` | [256] | BF16 | keep (QK-norm nhạy) |
+| `mlp.{gate,up,down}_proj` | [6144, 2048] | BF16 | **FP8** |
+
+### Dùng chung
+| Tensor | Shape | Note |
+|---|---|---|
+| `embed_tokens / lm_head` | [248320, 2048] | tied · **giữ BF16** (0.51B) — quantize logits hại accuracy nhiều |
+| `mtp.*` | 15 tensors | draft head speculative (0.06B) · keep |
+| `model.visual.*` | Qwen3_5VisionModel | 0.33B · không dùng cho text · keep hoặc bỏ nạp |
+
+### Vì sao "keep" các tensor nhỏ
+- **Norm (`*norm*`), layernorm, `q/k_norm`**: chỉ [128]–[2048], là hệ số scale rất
+  nhạy về số học; FP8 chúng ≈ 0 lợi ích bộ nhớ nhưng dễ lệch phân phối.
+- **`A_log`, `dt_bias`, `conv1d`, `in_proj_a/_b`**: tham số điều khiển động lực hồi
+  quy của GDN/SSM (state evolution). Rất nhạy — sai một chút là trôi cả chuỗi. Kích
+  thước tí hon nên giữ nguyên là "free".
+- **`embed_tokens/lm_head` (tied)**: đây là chiếu ra logits vocab 248k; quantize làm
+  hỏng phân phối output → tụt accuracy. Giữ BF16 (0.51B, ~1GB — đáng).
+
+### Recipe llm-compressor (ignore-list cụ thể)
+Quantize mọi `Linear` **trừ** danh sách ignore (các tensor không-Linear như norm /
+A_log / conv1d tự động bị bỏ qua, nhưng liệt kê cho chắc):
+
+```python
+# oneshot FP8 W8A8 (channel-wise), data-free
+from llmcompressor.modifiers.quantization import QuantizationModifier
+recipe = QuantizationModifier(
+    targets="Linear",
+    scheme="FP8_DYNAMIC",        # W8A8 FP8, per-channel weight, dynamic act
+    ignore=[
+        "lm_head",               # tied embedding → giữ BF16
+        "re:.*in_proj_a",        # cổng SSM nhỏ, nhạy
+        "re:.*in_proj_b",
+        "re:.*visual.*",         # vision tower (không dùng)
+        "re:.*mtp.*",            # draft head
+        # norms/A_log/dt_bias/conv1d không phải Linear → tự bỏ qua
+    ],
+)
+```
+
+### Serve trong vLLM
+- Checkpoint FP8 (compressed-tensors) → vLLM tự nhận qua metadata; hoặc ép
+  `--quantization compressed-tensors`.
+- **Bake checkpoint FP8 thẳng vào image** (luật cấm pull runtime).
+- **Verify GPQA** sau khi quantize, giữ margin ≥5 điểm so với ngưỡng 0.30. Nếu tụt,
+  mở rộng ignore-list (vd giữ thêm `down_proj` hoặc layer đầu/cuối).
+
+**Tác động ước lượng:** ~1.37B GEMM `*_proj` xuống FP8 → giải phóng ~1.3–2.2GB VRAM
+**và** tăng tốc GEMM prefill (đòn bẩy B — thắng round-1). `lm_head` 0.51B + vision
+0.33B vẫn BF16 (hoặc bỏ vision).
+
+---
+
 ## 5. THAM CHIẾU CỜ vLLM ĐẦY ĐỦ (từ source `arg_utils.py`)
 
 > ⚠️ Tập cờ thay đổi theo version. **Verify bằng `vllm serve --help` trên đúng image
