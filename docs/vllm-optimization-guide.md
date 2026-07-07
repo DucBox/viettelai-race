@@ -1,202 +1,202 @@
-# vLLM tuning + nguyen ly goc — Track 3 (Qwen3.5-2B)
+# vLLM tuning + nguyên lý gốc — Track 3 (Qwen3.5-2B)
 
-Kim chi nam toi uu serving. Rang buoc cung: **chi duoc serve bang vLLM**, khong doi
-engine. Moi thu duoi day deu xoay quanh cac co cua vLLM.
+Kim chỉ nam tối ưu serving. Ràng buộc cứng: **chỉ được serve bằng vLLM**, không đổi
+engine. Mọi thứ dưới đây đều xoay quanh các cờ của vLLM.
 
-> Ghi nho khung canh: **single GPU, prefill-bound** (prefill:decode ~95:1), diem
-> mat nhieu nhat o **round-1 cold start** (20 request × ~13k token don trong 475ms).
-> Cua diem: TTFT F=100/C=1500ms (γ=2, rong), TPOT F=20/C=45ms (hep). Decode hien
-> gan sat tran diem → uu tien tuyet doi la **prefill/TTFT**.
+> Ghi nhớ khung cảnh: **single GPU, prefill-bound** (prefill:decode ~95:1), điểm
+> mất nhiều nhất ở **round-1 cold start** (20 request × ~13k token dồn trong 475ms).
+> Cửa điểm: TTFT F=100/C=1500ms (γ=2, rộng), TPOT F=20/C=45ms (hẹp). Decode hiện
+> gần sát trần điểm → ưu tiên tuyệt đối là **prefill/TTFT**.
 
-## 0. Su that phan cung ve model (doc tu config.json)
+## 0. Sự thật phần cứng về model (đọc từ config.json)
 
-| | Gia tri | He qua |
+| | Giá trị | Hệ quả |
 |---|---|---|
-| Layer | 24, nhip `L L L F` (`full_attention_interval=4`) | **6 full-attn + 18 GDN (linear)** |
-| KV cache phinh o | **chi 6 layer full-attn** | footprint KV nho hon Transformer thuan |
-| GDN state | phang ~19 MB/seq, moi do dai | 18 layer khong ton KV theo context |
-| `head_dim` | **256** | ⚠️ canh bao cho FP8 KV (xem §2) |
-| Attention heads | 8 query / **2 KV** (GQA) | KV moi layer da rat nho |
+| Layer | 24, nhịp `L L L F` (`full_attention_interval=4`) | **6 full-attn + 18 GDN (linear)** |
+| KV cache phình ở | **chỉ 6 layer full-attn** | footprint KV nhỏ hơn Transformer thuần |
+| GDN state | phẳng ~19 MB/seq, mọi độ dài | 18 layer không tốn KV theo context |
+| `head_dim` | **256** | ⚠️ cảnh báo cho FP8 KV (xem §2) |
+| Attention heads | 8 query / **2 KV** (GQA) | KV mỗi layer đã rất nhỏ |
 | `hidden_size` | 2048 | |
-| Vision tower | 0.33B, **khong dung** cho text | dead weight trong VRAM |
-| MTP head | 0.06B, draft speculative | co san (uu tien thap) |
-| Params | 2.27B, BF16, Dense (no MoE) | 1.37B GEMM `*_proj` la phan FP8-able |
+| Vision tower | 0.33B, **không dùng** cho text | dead weight trong VRAM |
+| MTP head | 0.06B, draft speculative | có sẵn (ưu tiên thấp) |
+| Params | 2.27B, BF16, Dense (no MoE) | 1.37B GEMM `*_proj` là phần FP8-able |
 
 ---
 
-## 1. Nguyen ly goc: VRAM chua gi → vi sao evict → 3 don bay
+## 1. Nguyên lý gốc: VRAM chứa gì → vì sao evict → 3 đòn bẩy
 
-### 1.1 Ngan sach VRAM (vi du 18GB × `gpu-mem-util` 0.90 = 16.2 GB)
+### 1.1 Ngân sách VRAM (ví dụ 18GB × `gpu-mem-util` 0.90 = 16.2 GB)
 
 ```
 ① Model weights   +   ② Framework/runtime   +   ③ KV CACHE POOL
-  ~4.5 GB (BF16)        ~1–2 GB                    = phan con lai (~10 GB)
-  co dinh               gan co dinh                 CO GIAN — chien truong
+  ~4.5 GB (BF16)        ~1–2 GB                    = phần còn lại (~10 GB)
+  cố định               gần cố định                 CO GIÃN — chiến trường
 ```
 
-- **① Weights**: 2.27B × 2 byte (BF16) ≈ **4.5 GB**. FP8 → ~2.3 GB (giai phong ~2.2GB).
-  Gom ca vision 0.33B (~0.66GB) nam chet.
-- **② Framework** (khong phai context prompt): CUDA context, activation buffer,
-  CUDA graph capture, workspace kernel. Gan co dinh.
-- **③ KV pool = ngan sach − ① − ②**. Chi phan nay co gian. Giu **KV blocks (6
-  full-attn) + GDN state (18 layer)** duoi dang block co dinh.
+- **① Weights**: 2.27B × 2 byte (BF16) ≈ **4.5 GB**. FP8 → ~2.3 GB (giải phóng ~2.2GB).
+  Gồm cả vision 0.33B (~0.66GB) nằm chết.
+- **② Framework** (không phải context prompt): CUDA context, activation buffer,
+  CUDA graph capture, workspace kernel. Gần cố định.
+- **③ KV pool = ngân sách − ① − ②**. Chỉ phần này co giãn. Giữ **KV blocks (6
+  full-attn) + GDN state (18 layer)** dưới dạng block cố định.
 
-### 1.2 Toan KV cu the (quan trong cho ket luan)
+### 1.2 Toán KV cụ thể (quan trọng cho kết luận)
 
-Moi token, moi full-attn layer: K+V = 2 × (num_kv_heads × head_dim) = 2 × (2×256)
-= 1024 phan tu. BF16 = 2048 byte/token/layer × 6 layer = **~12 KB/token** (FP8: ~6KB).
+Mỗi token, mỗi full-attn layer: K+V = 2 × (num_kv_heads × head_dim) = 2 × (2×256)
+= 1024 phần tử. BF16 = 2048 byte/token/layer × 6 layer = **~12 KB/token** (FP8: ~6KB).
 
 - 1 session 25k token: 25.000 × 12KB ≈ **300 MB** KV + 19MB GDN state ≈ 320 MB.
-- 20 session: **~6.4 GB**. Pool ~10GB → **du cho ca 20 session, KHONG bi memory-bound**
-  o muc 0.90 tren 18GB.
+- 20 session: **~6.4 GB**. Pool ~10GB → **đủ cho cả 20 session, KHÔNG bị memory-bound**
+  ở mức 0.90 trên 18GB.
 
-> **Ket luan then chot:** vi GQA (chi 2 KV head) + chi 6 layer full-attn, KV o day
-> **von da rat nho**. Bo nho gan nhu **khong phai** rang buoc that su cua bai nay →
-> cac don bay ve bo nho (KV quant, tang util) **it tac dung hon** cac don bay ve
-> **toc do prefill**. Day la dieu can nho khi xep uu tien.
+> **Kết luận then chốt:** vì GQA (chỉ 2 KV head) + chỉ 6 layer full-attn, KV ở đây
+> **vốn đã rất nhỏ**. Bộ nhớ gần như **không phải** ràng buộc thật sự của bài này →
+> các đòn bẩy về bộ nhớ (KV quant, tăng util) **ít tác dụng hơn** các đòn bẩy về
+> **tốc độ prefill**. Đây là điều cần nhớ khi xếp ưu tiên.
 
-### 1.3 Vi sao phai evict
+### 1.3 Vì sao phải evict
 
-Pool ③ chot cung luc boot. Trong pool co 2 loai cu dan: **active** (request dang
-chay — khong duoc dua) va **cached prefix** (KV cua request da xong, giu de tai
-dung — **evictable LRU**). Khi block day → evict cached prefix cu → turn sau dang
-le hit thi mien → **re-prefill → TTFT vot**. Neu active cung thieu → **preemption**
-(`vllm:num_preemptions>0`) → phat nang.
+Pool ③ chốt cứng lúc boot. Trong pool có 2 loại cư dân: **active** (request đang
+chạy — không được đưa) và **cached prefix** (KV của request đã xong, giữ để tái
+dùng — **evictable LRU**). Khi block đầy → evict cached prefix cũ → turn sau đáng
+lẽ hit thì miss → **re-prefill → TTFT vọt**. Nếu active cũng thiếu → **preemption**
+(`vllm:num_preemptions>0`) → phạt nặng.
 
-### 1.4 Ba don bay goc (chi co 3, moi giai phap la mot nhanh con)
+### 1.4 Ba đòn bẩy gốc (chỉ có 3, mỗi giải pháp là một nhánh con)
 
 ```
-A. KHONG TINH LAI  →  tai dung KV (prefix caching)         [thang round 2–6]
-B. TINH NHANH HON  →  cung viec, it thoi gian (FP8, kernel, batch, CUDA graph)  [thang round 1]
-C. GIU DUOC CACHE  →  quan bo nho de A con tac dung          [nen tang]
+A. KHÔNG TÍNH LẠI  →  tái dùng KV (prefix caching)         [thắng round 2–6]
+B. TÍNH NHANH HƠN  →  cùng việc, ít thời gian (FP8, kernel, batch, CUDA graph)  [thắng round 1]
+C. GIỮ ĐƯỢC CACHE  →  quản bộ nhớ để A còn tác dụng          [nền tảng]
 ```
 
-⚠️ **Round 1 khong co gi de cache → don bay A = 0 → chi B cuu duoc.** Ma round 1 la
-noi mat diem nhat. Nen **B (toc do prefill tho) la thu quyet dinh thu hang**, khong
-phai cache. "Ai cache tot hon" chi thang tu round 2 tro di.
+⚠️ **Round 1 không có gì để cache → đòn bẩy A = 0 → chỉ B cứu được.** Mà round 1 là
+nơi mất điểm nhất. Nên **B (tốc độ prefill thô) là thứ quyết định thứ hạng**, không
+phải cache. "Ai cache tốt hơn" chỉ thắng từ round 2 trở đi.
 
 ---
 
 ## 2. KV cache quantization (`--kv-cache-dtype`)
 
-KV cache cung chi la so — luu BF16 (2 byte) hay **FP8 (1 byte)** → **halves bo nho
-moi token cached**, luu duoc nhieu token hon → it evict, giu prefix lau hon.
+KV cache cũng chỉ là số — lưu BF16 (2 byte) hay **FP8 (1 byte)** → **halves bộ nhớ
+mỗi token cached**, lưu được nhiều token hơn → ít evict, giữ prefix lâu hơn.
 
-**Cach dung (vLLM):**
-- `--kv-cache-dtype fp8` (mac dinh `fp8_e4m3`; co `fp8_e5m2`). `auto` = giu nguyen dtype model.
-- `--kv-cache-dtype-skip-layers <...>` : giu mot so layer o BF16 (vd sliding-window). Model nay **khong co sliding window** nen it dung.
-- `--calculate-kv-scales` : tu uoc luong scale luc warmup. Mac dinh scale=1.0 (uncalibrated). Muon chuan hon → calibrate bang **llm-compressor** (per-tensor / per-head scale).
+**Cách dùng (vLLM):**
+- `--kv-cache-dtype fp8` (mặc định `fp8_e4m3`; có `fp8_e5m2`). `auto` = giữ nguyên dtype model.
+- `--kv-cache-dtype-skip-layers <...>` : giữ một số layer ở BF16 (vd sliding-window). Model này **không có sliding window** nên ít dùng.
+- `--calculate-kv-scales` : tự ước lượng scale lúc warmup. Mặc định scale=1.0 (uncalibrated). Muốn chuẩn hơn → calibrate bằng **llm-compressor** (per-tensor / per-head scale).
 
-**Loi ich:** giam 50% bo nho KV; decode ITL con ~54% BF16; ho tro context dai hon.
-Accuracy tut rat it (thuong 1–2 diem, long-context recover 94–98%).
+**Lợi ích:** giảm 50% bộ nhớ KV; decode ITL còn ~54% BF16; hỗ trợ context dài hơn.
+Accuracy tụt rất ít (thường 1–2 điểm, long-context recover 94–98%).
 
-### ⚠️ Nhung tai sao o BAI NAY, KV FP8 co the KHONG dang / thậm chí HAI
+### ⚠️ Nhưng tại sao ở BÀI NÀY, KV FP8 có thể KHÔNG đáng / thậm chí HẠI
 
-1. **`head_dim = 256`** — blog vLLM FP8-KV canh bao ro: model `head_dim=256` khi
-   **prefill quan trong** thi FP8 KV lam **tang overhead TTFT** (two-level
-   accumulation). Ma TTFT chinh la metric mat diem cua minh → **rui ro nguoc**.
-2. **KV von da nho** (§1.2): tiet kiem 3GB tren pool 10GB khong phai nut that →
-   loi ich bo nho khong dang ke o day.
-3. **Break-even ~7k token**: context minh 13–27k thi qua nguong, nhung loi ich
-   chinh la o decode/bo nho — ca hai deu **khong** phai cho minh dang can.
+1. **`head_dim = 256`** — blog vLLM FP8-KV cảnh báo rõ: model `head_dim=256` khi
+   **prefill quan trọng** thì FP8 KV làm **tăng overhead TTFT** (two-level
+   accumulation). Mà TTFT chính là metric mất điểm của mình → **rủi ro ngược**.
+2. **KV vốn đã nhỏ** (§1.2): tiết kiệm 3GB trên pool 10GB không phải nút thắt →
+   lợi ích bộ nhớ không đáng kể ở đây.
+3. **Break-even ~7k token**: context mình 13–27k thì qua ngưỡng, nhưng lợi ích
+   chính là ở decode/bộ nhớ — cả hai đều **không** phải cho mình đang cần.
 
-→ **Khuyen nghi:** van **A/B test** `--kv-cache-dtype fp8` (do TTFT truoc/sau bang
-script 07 + 08), nhung **dung ky vong** day la don bay lon; nhieu kha nang **net
-tieu cuc cho TTFT**. Uu tien **FP8 *weight*** (§4) truoc — no vua nhanh prefill vua
-giai phong VRAM that su.
+→ **Khuyến nghị:** vẫn **A/B test** `--kv-cache-dtype fp8` (đo TTFT trước/sau bằng
+script 07 + 08), nhưng **đừng kỳ vọng** đây là đòn bẩy lớn; nhiều khả năng **net
+tiêu cực cho TTFT**. Ưu tiên **FP8 *weight*** (§4) trước — nó vừa nhanh prefill vừa
+giải phóng VRAM thật sự.
 
-> Luu y phan biet: **FP8 weight** (`--quantization`, quantize trong so) khac **FP8
-> KV cache** (`--kv-cache-dtype`, quantize cache). Hai thu doc lap, co the bat rieng.
+> Lưu ý phân biệt: **FP8 weight** (`--quantization`, quantize trọng số) khác **FP8
+> KV cache** (`--kv-cache-dtype`, quantize cache). Hai thứ độc lập, có thể bật riêng.
 
-Model GDN con co cache rieng: `--mamba-cache-dtype` / `--mamba-ssm-cache-dtype`
-lang le quantize state 18 layer GDN — nhung state chi ~19MB/seq nen loi ich bo nho
-cang nho; chu y độ chinh xac.
-
----
-
-## 3. Checklist diem nghen (chi vLLM)
-
-- [ ] **① Cold-start round 1** — 20×~13k token don, prefill thuan, khong cache cuu. Mat diem nhat.
-- [ ] **② Prefix caching hybrid CO RUI RO** — vLLM prefix caching cho GDN/Mamba-hybrid la **experimental + co bug ghi nhan** (block-size ep = 528 token de align Mamba; chi cache block hoan chinh → duoi prefix mat cache). Phai verify, dung tin mac dinh.
-- [ ] **③ Prefill compute-bound** — 1.37B GEMM BF16, quyet dinh TTFT.
-- [ ] **④ Eviction/ngan sach VRAM** — thuc te **khong phai** nut that o 18GB (KV nho), nhung van phai giu `num_preemptions=0` va khong evict giua round.
-- [ ] **⑤ Nghen CPU (3 core/8GB)** — tokenize 20 prompt dai + overhead HTTP/streaming co the cong tram ms vao TTFT vo hinh.
-- [ ] **⑥ TPOT dưới burst** — cua hep 20–45ms; batch prefill to → decode-step phinh → TPOT vot.
-- [ ] **⑦ Accuracy gate (nhan)** — FP8 phai giu GPQA ≥ ~0.30, khong mat trang.
-- [ ] **⑧ Startup < 15 phut** — CUDA graph compile + warmup khong duoc rot healthcheck.
+Model GDN còn có cache riêng: `--mamba-cache-dtype` / `--mamba-ssm-cache-dtype`
+lặng lẽ quantize state 18 layer GDN — nhưng state chỉ ~19MB/seq nên lợi ích bộ nhớ
+càng nhỏ; chú ý độ chính xác.
 
 ---
 
-## 4. Checklist giai phap (chi vLLM) — anh xa toi co
+## 3. Checklist điểm nghẽn (chỉ vLLM)
 
-> Uu tien theo don bay. Vi prefill-bound, nhom B (tinh nhanh) va A (cache) an diem nhat.
+- [ ] **① Cold-start round 1** — 20×~13k token dồn, prefill thuần, không cache cứu. Mất điểm nhất.
+- [ ] **② Prefix caching hybrid CÓ RỦI RO** — vLLM prefix caching cho GDN/Mamba-hybrid là **experimental + có bug ghi nhận** (block-size ép ~528–544 token để align Mamba; chỉ cache block hoàn chỉnh → đuôi prefix mất cache). Phải verify, đừng tin mặc định.
+- [ ] **③ Prefill compute-bound** — 1.37B GEMM BF16, quyết định TTFT.
+- [ ] **④ Eviction/ngân sách VRAM** — thực tế **không phải** nút thắt ở 18GB (KV nhỏ), nhưng vẫn phải giữ `num_preemptions=0` và không evict giữa round.
+- [ ] **⑤ Nghẽn CPU (3 core/8GB)** — tokenize 20 prompt dài + overhead HTTP/streaming có thể cộng trăm ms vào TTFT vô hình.
+- [ ] **⑥ TPOT dưới burst** — cửa hẹp 20–45ms; batch prefill to → decode-step phình → TPOT vọt.
+- [ ] **⑦ Accuracy gate (nhân)** — FP8 phải giữ GPQA ≥ ~0.30, không mất trắng.
+- [ ] **⑧ Startup < 15 phút** — CUDA graph compile + warmup không được rớt healthcheck.
 
-### 🟠 B — Tinh prefill nhanh hon (thang round 1)
-- [ ] **FP8 weight quant** *(nghen ①③)* — `--quantization` + checkpoint FP8 (tao bang **llm-compressor**, ignore `lm_head`+layer nhay). Tang toc GEMM `*_proj` **va** giai phong ~2.2GB. ⚠️ verify GPQA giu margin. Bake vao image (cam pull runtime).
-- [ ] **Chunked prefill + sweep** *(nghen ①⑥)* — `--enable-chunked-prefill`, `--max-num-batched-tokens` (to → TTFT tot, canh TPOT), `--long-prefill-token-threshold`, `--max-num-partial-prefills` / `--max-long-partial-prefills`.
-- [ ] **Bo vision tower** *(nghen ④)* — `--language-model-only` (neu co) de bo xu ly multimodal / `--skip-mm-profiling`; hoac `--limit-mm-per-prompt image=0`. Tra VRAM ve KV, bot compute.
-- [ ] **GDN prefill backend** — `--gdn-prefill-backend flashinfer|triton` chon kernel nhanh cho 18 layer GDN (rieng cho arch nay).
-- [ ] **CUDA graphs** *(nghen ⑥)* — **KHONG** `--enforce-eager` (giu CUDA graph); tinh `--cudagraph-capture-sizes` / `--max-cudagraph-capture-size` phu batch 20–32.
+---
+
+## 4. Checklist giải pháp (chỉ vLLM) — ánh xạ tới cờ
+
+> Ưu tiên theo đòn bẩy. Vì prefill-bound, nhóm B (tính nhanh) và A (cache) ăn điểm nhất.
+
+### 🟠 B — Tính prefill nhanh hơn (thắng round 1)
+- [ ] **FP8 weight quant** *(nghẽn ①③)* — `--quantization` + checkpoint FP8 (tạo bằng **llm-compressor**, ignore `lm_head`+layer nhạy). Tăng tốc GEMM `*_proj` **và** giải phóng ~2.2GB. ⚠️ verify GPQA giữ margin. Bake vào image (cấm pull runtime).
+- [ ] **Chunked prefill + sweep** *(nghẽn ①⑥)* — `--enable-chunked-prefill`, `--max-num-batched-tokens` (to → TTFT tốt, canh TPOT), `--long-prefill-token-threshold`, `--max-num-partial-prefills` / `--max-long-partial-prefills`.
+- [ ] **Bỏ vision tower** *(nghẽn ④)* — `--language-model-only` (nếu có) để bỏ xử lý multimodal / `--skip-mm-profiling`; hoặc `--limit-mm-per-prompt image=0`. Trả VRAM về KV, bớt compute.
+- [ ] **GDN prefill backend** — `--gdn-prefill-backend flashinfer|triton` chọn kernel nhanh cho 18 layer GDN (riêng cho arch này).
+- [ ] **CUDA graphs** *(nghẽn ⑥)* — **KHÔNG** `--enforce-eager` (giữ CUDA graph); tính `--cudagraph-capture-sizes` / `--max-cudagraph-capture-size` phủ batch 20–32.
 - [ ] **Attention backend** — `--attention-backend` (FlashAttention/FlashInfer), `--enable-flashinfer-autotune`.
 
-### 🔵 A — Tai dung cache (thang round 2–6)
-- [ ] **Bat + verify prefix caching** *(nghen ②)* — `--enable-prefix-caching`; do that su an bang `07_per_request_report.py` (`cache_rd/hit%`). Thu `--prefix-caching-hash-algo`.
-- [ ] **Ha max-model-len** *(nghen ④)* — `--max-model-len 32768` (tu 262144) → engine cap KV sat nhu cau.
-- [ ] **Block-size / hybrid manager** *(nghen ②)* — `--block-size`, `--mamba-block-size`; can nhac `--disable-hybrid-kv-cache-manager` de so sanh (bug align-mode). `--kv-sharing-fast-prefill` neu co.
+### 🔵 A — Tái dùng cache (thắng round 2–6)
+- [ ] **Bật + verify prefix caching** *(nghẽn ②)* — `--enable-prefix-caching`; đo thật sự ăn bằng `07_per_request_report.py` (`cache_rd/hit%`). Thử `--prefix-caching-hash-algo`.
+- [ ] **Hạ max-model-len** *(nghẽn ④)* — `--max-model-len 32768` (từ 262144) → engine cấp KV sát nhu cầu.
+- [ ] **Block-size / hybrid manager** *(nghẽn ②)* — `--block-size`, `--mamba-block-size`; cân nhắc `--disable-hybrid-kv-cache-manager` để so sánh (bug align-mode). `--kv-sharing-fast-prefill` nếu có.
 
-### 🟢 C — Giu cache / quan bo nho
-- [ ] **`--gpu-memory-utilization 0.95`** — pool to hon (nhung §1.2: khong phai nut that o day).
-- [ ] **FP8 weight** (trung nhom B) → khoi ① nho → pool to → don kep.
-- [ ] **`--kv-cache-dtype fp8`** — A/B test, **nhung xem canh bao §2** (head_dim=256 hai TTFT).
-- [ ] **Theo doi `--kv-cache-metrics`** + `num_preemptions=0`.
+### 🟢 C — Giữ cache / quản bộ nhớ
+- [ ] **`--gpu-memory-utilization 0.95`** — pool to hơn (nhưng §1.2: không phải nút thắt ở đây).
+- [ ] **FP8 weight** (trùng nhóm B) → khối ① nhỏ → pool to → đòn kép.
+- [ ] **`--kv-cache-dtype fp8`** — A/B test, **nhưng xem cảnh báo §2** (head_dim=256 hại TTFT).
+- [ ] **Theo dõi `--kv-cache-metrics`** + `num_preemptions=0`.
 
-### ⚙️ Serving/CPU (re, de bo sot)
-- [ ] `--disable-log-stats` + tat request logging → giam tai 3 core.
-- [ ] Dam bao **streaming that** (server buffer output → TTFT do duoc te oan).
-- [ ] **Warmup luc boot** bang request tu tao (**KHONG dung noi dung trace** — luat cam pre-compute) de compile CUDA graph + nong allocator truoc healthcheck.
+### ⚙️ Serving/CPU (rẻ, dễ bỏ sót)
+- [ ] `--disable-log-stats` + tắt request logging → giảm tải 3 core.
+- [ ] Đảm bảo **streaming thật** (server buffer output → TTFT đo được tệ oan).
+- [ ] **Warmup lúc boot** bằng request tự tạo (**KHÔNG dùng nội dung trace** — luật cấm pre-compute) để compile CUDA graph + nóng allocator trước healthcheck.
 
-### 🟢 Decode/TPOT (uu tien thap — dang on)
-- [ ] Speculative decoding qua **MTP head**: `--speculative-config` / `--spec-method` / `--spec-tokens`. CHI khi do TPOT thuc >20ms (dat Floor roi thi khong them diem). Rui ro.
+### 🟢 Decode/TPOT (ưu tiên thấp — đang ổn)
+- [ ] Speculative decoding qua **MTP head**: `--speculative-config` / `--spec-method` / `--spec-tokens`. CHỈ khi đo TPOT thực >20ms (đạt Floor rồi thì không thêm điểm). Rủi ro.
 
 ---
 
-## 5. THAM CHIEU CO vLLM DAY DU (tu source `arg_utils.py`)
+## 5. THAM CHIẾU CỜ vLLM ĐẦY ĐỦ (từ source `arg_utils.py`)
 
-> ⚠️ Tap co thay doi theo version. **Verify bang `vllm serve --help` tren dung image
-> cua ban** (baseline BTC: `vllm/vllm-openai:v0.22.1`). Danh dau: 🎯 = dang de y cho bai nay.
+> ⚠️ Tập cờ thay đổi theo version. **Verify bằng `vllm serve --help` trên đúng image
+> của bạn** (baseline BTC: `vllm/vllm-openai:v0.22.1`). Đánh dấu: 🎯 = đang để ý cho bài này.
 
 ### (1) Model & loading
-`--model` · `--tokenizer` · `--tokenizer-mode` · `--trust-remote-code` · `--dtype` 🎯(bf16/auto) · `--seed` · `--max-model-len` 🎯 · `--served-model-name` 🎯 · `--load-format` 🎯 · `--download-dir` · `--revision` · `--hf-config-path` · `--config-format` · `--model-impl` · `--override-attention-dtype` · `--override-generation-config` · `--generation-config` · `--safetensors-load-strategy` / `--safetensors-prefetch-num-threads` / `--safetensors-prefetch-block-size` 🎯(toc do load → startup) · `--ignore-patterns` · `--model-weights` · `--hf-overrides` · `--skip-tokenizer-init`
+`--model` · `--tokenizer` · `--tokenizer-mode` · `--trust-remote-code` · `--dtype` 🎯(bf16/auto) · `--seed` · `--max-model-len` 🎯 · `--served-model-name` 🎯 · `--load-format` 🎯 · `--download-dir` · `--revision` · `--hf-config-path` · `--config-format` · `--model-impl` · `--override-attention-dtype` · `--override-generation-config` · `--generation-config` · `--safetensors-load-strategy` / `--safetensors-prefetch-num-threads` / `--safetensors-prefetch-block-size` 🎯(tốc độ load → startup) · `--ignore-patterns` · `--model-weights` · `--hf-overrides` · `--skip-tokenizer-init`
 
-### (2) Parallelism (single GPU → hau het = 1)
-`--tensor-parallel-size/-tp` 🎯(=1) · `--pipeline-parallel-size/-pp` · `--data-parallel-size/-dp` · `--decode-context-parallel-size/-dcp` · `--prefill-context-parallel-size/-pcp` · `--enable-expert-parallel/-ep` (MoE — n/a) · `--distributed-executor-backend` · `--max-parallel-loading-workers` 🎯(startup) · `--worker-cls` · `--numa-bind` · `--device-ids` · (nhieu co DP/EP multi-node khac — khong lien quan single GPU)
+### (2) Parallelism (single GPU → hầu hết = 1)
+`--tensor-parallel-size/-tp` 🎯(=1) · `--pipeline-parallel-size/-pp` · `--data-parallel-size/-dp` · `--decode-context-parallel-size/-dcp` · `--prefill-context-parallel-size/-pcp` · `--enable-expert-parallel/-ep` (MoE — n/a) · `--distributed-executor-backend` · `--max-parallel-loading-workers` 🎯(startup) · `--worker-cls` · `--numa-bind` · `--device-ids` · (nhiều cờ DP/EP multi-node khác — không liên quan single GPU)
 
 ### (3) Memory & KV cache
-`--gpu-memory-utilization` 🎯 · `--kv-cache-dtype` 🎯 · `--kv-cache-dtype-skip-layers` 🎯 · `--calculate-kv-scales` 🎯 · `--block-size` 🎯 · `--kv-cache-memory-bytes` · `--num-gpu-blocks-override` 🎯 · `--cpu-offload-gb` · `--cpu-offload-params` · `--kv-offloading-size` / `--kv-offloading-backend` · `--kv-sharing-fast-prefill` 🎯 · `--swap-space` (best_of>1; co the =0)
+`--gpu-memory-utilization` 🎯 · `--kv-cache-dtype` 🎯 · `--kv-cache-dtype-skip-layers` 🎯 · `--calculate-kv-scales` 🎯 · `--block-size` 🎯 · `--kv-cache-memory-bytes` · `--num-gpu-blocks-override` 🎯 · `--cpu-offload-gb` · `--cpu-offload-params` · `--kv-offloading-size` / `--kv-offloading-backend` · `--kv-sharing-fast-prefill` 🎯 · `--swap-space` (best_of>1; có thể =0)
 
 ### (4) Prefix caching
-`--enable-prefix-caching` 🎯 (`--no-enable-prefix-caching` de tat) · `--prefix-caching-hash-algo` 🎯
+`--enable-prefix-caching` 🎯 (`--no-enable-prefix-caching` để tắt) · `--prefix-caching-hash-algo` 🎯
 
 ### (5) Scheduling / batching / chunked prefill
-`--max-num-batched-tokens` 🎯 · `--max-num-seqs` 🎯 · `--enable-chunked-prefill` 🎯 · `--long-prefill-token-threshold` 🎯 · `--max-num-partial-prefills` 🎯 · `--max-long-partial-prefills` 🎯 · `--scheduling-policy` 🎯(fcfs/priority) · `--scheduler-reserve-full-isl` · `--watermark` · `--prefill-schedule-interval` · `--disable-hybrid-kv-cache-manager` 🎯(so sanh cho hybrid) · `--async-scheduling` · `--stream-interval` 🎯 · `--scheduler-cls`
+`--max-num-batched-tokens` 🎯 · `--max-num-seqs` 🎯 · `--enable-chunked-prefill` 🎯 · `--long-prefill-token-threshold` 🎯 · `--max-num-partial-prefills` 🎯 · `--max-long-partial-prefills` 🎯 · `--scheduling-policy` 🎯(fcfs/priority) · `--scheduler-reserve-full-isl` · `--watermark` · `--prefill-schedule-interval` · `--disable-hybrid-kv-cache-manager` 🎯(so sánh cho hybrid) · `--async-scheduling` · `--stream-interval` 🎯 · `--scheduler-cls`
 
 ### (6) Quantization (weight)
 `--quantization/-q` 🎯 · `--quantization-config` 🎯 · `--allow-deprecated-quantization`
 
 ### (7) CUDA graphs & compilation
-`--enforce-eager` 🎯(TAT no de giu CUDA graph) · `--cudagraph-capture-sizes` 🎯 · `--max-cudagraph-capture-size` 🎯 · `--compilation-config/-cc` 🎯 · `--optimization-level` · `--performance-mode`
+`--enforce-eager` 🎯(TẮT nó để giữ CUDA graph) · `--cudagraph-capture-sizes` 🎯 · `--max-cudagraph-capture-size` 🎯 · `--compilation-config/-cc` 🎯 · `--optimization-level` · `--performance-mode`
 
 ### (8) Attention & kernels
 `--attention-backend` 🎯 · `--attention-config/-ac` · `--enable-flashinfer-autotune` 🎯 · `--linear-backend` 🎯(GDN linear) · `--ir-op-priority` · `--kernel-config`
 
-### (9) Mamba / GDN (rieng arch nay)
+### (9) Mamba / GDN (riêng arch này)
 `--mamba-backend` 🎯(triton/…) · `--gdn-prefill-backend` 🎯(flashinfer/triton) · `--mamba-cache-dtype` 🎯 · `--mamba-ssm-cache-dtype` 🎯 · `--mamba-block-size` 🎯 · `--mamba-cache-mode` 🎯 · `--enable-mamba-cache-stochastic-rounding`
 
 ### (10) Speculative decoding (MTP)
 `--speculative-config/-sc` 🎯 · `--spec-method` 🎯 · `--spec-model` · `--spec-tokens` 🎯
 
-### (11) Multimodal (bo vision)
-`--language-model-only` 🎯(bo xu ly multimodal) · `--limit-mm-per-prompt` 🎯 · `--skip-mm-profiling` 🎯 · `--mm-encoder-*` (nhieu co encoder) · `--media-io-kwargs` · `--mm-processor-kwargs`
+### (11) Multimodal (bỏ vision)
+`--language-model-only` 🎯(bỏ xử lý multimodal) · `--limit-mm-per-prompt` 🎯 · `--skip-mm-profiling` 🎯 · `--mm-encoder-*` (nhiều cờ encoder) · `--media-io-kwargs` · `--mm-processor-kwargs`
 
 ### (12) Logging / API / observability
 `--disable-log-stats` 🎯 · `--kv-cache-metrics` 🎯 / `--kv-cache-metrics-sample` · `--cudagraph-metrics` · `--otlp-traces-endpoint` · `--collect-detailed-traces` · `--enable-logging-iteration-details` · `--show-hidden-metrics-for-version` · `--enable-mfu-metrics`
@@ -204,32 +204,32 @@ cang nho; chu y độ chinh xac.
 ### (13) Misc
 `--max-logprobs` 🎯 · `--disable-cascade-attn` 🎯 · `--disable-sliding-window` (n/a) · `--enable-sleep-mode` · `--enable-cumem-allocator` · `--shutdown-timeout` · `--tokens-only` · `--enable-prompt-embeds` · `--logits-processors` · `--kv-transfer-config` / `--kv-events-config` (disaggregated — n/a single GPU) · `--additional-config`
 
-### (14) LoRA / structured outputs / diffusion — khong lien quan bai nay
+### (14) LoRA / structured outputs / diffusion — không liên quan bài này
 `--enable-lora` … · `--reasoning-parser` · `--structured-outputs-config` · `--diffusion-config` …
 
 ---
 
-## 6. Cau hinh khoi diem de nghi (roi sweep)
+## 6. Cấu hình khởi điểm đề nghị (rồi sweep)
 
 ```bash
 vllm serve <model> \
   --served-model-name qwen3.5-2b \
   --dtype bfloat16 \
-  --max-model-len 32768 \              # tu 262144 → cap KV sat nhu cau
+  --max-model-len 32768 \              # từ 262144 → cấp KV sát nhu cầu
   --gpu-memory-utilization 0.95 \
-  --enable-prefix-caching \            # verify bang script 07 (cache_rd/hit%)
+  --enable-prefix-caching \            # verify bằng script 07 (cache_rd/hit%)
   --enable-chunked-prefill \
-  --max-num-batched-tokens 16384 \     # sweep 8192↔32768 → toi uu TTFT, canh TPOT
+  --max-num-batched-tokens 16384 \     # sweep 8192↔32768 → tối ưu TTFT, canh TPOT
   --max-num-seqs 32 \                  # ≥ 20 concurrent + headroom
   --disable-log-stats
-  # --language-model-only              # neu co: bo vision tower
-  # --quantization <fp8-method>        # DON BAY LON NHAT (checkpoint FP8 bake san) — verify GPQA
-  # --kv-cache-dtype fp8               # A/B ONLY — canh bao head_dim=256 hai TTFT (§2)
-  # --gdn-prefill-backend flashinfer   # neu co, cho 18 layer GDN
+  # --language-model-only              # nếu có: bỏ vision tower
+  # --quantization <fp8-method>        # ĐÒN BẨY LỚN NHẤT (checkpoint FP8 bake sẵn) — verify GPQA
+  # --kv-cache-dtype fp8               # A/B ONLY — cảnh báo head_dim=256 hại TTFT (§2)
+  # --gdn-prefill-backend flashinfer   # nếu có, cho 18 layer GDN
 ```
 
-Ky luat do: **moi lan doi 1 bien**, ghi lai bang `config ↔ ERS (script 08) ↔ GPQA`,
-so voi baseline. Uu tien: **verify prefix caching → FP8 weight → sweep chunked
-prefill → bo vision/CPU hygiene → (KV quant, spec decode) chi khi do co loi that**.
+Kỷ luật đo: **mỗi lần đổi 1 biến**, ghi lại bằng `config ↔ ERS (script 08) ↔ GPQA`,
+so với baseline. Ưu tiên: **verify prefix caching → FP8 weight → sweep chunked
+prefill → bỏ vision/CPU hygiene → (KV quant, spec decode) chỉ khi đo có lợi thật**.
 
 **Sources:** [vLLM engine args (arg_utils.py)](https://github.com/vllm-project/vllm/blob/main/vllm/engine/arg_utils.py) · [Quantized KV cache](https://docs.vllm.ai/en/stable/features/quantization/quantized_kvcache/) · [FP8 KV-cache state (2026-04)](https://github.com/vllm-project/vllm-project.github.io/blob/main/_posts/2026-04-22-fp8-kvcache.md) · [Optimization & tuning](https://docs.vllm.ai/en/stable/configuration/optimization/) · [Qwen3.5 prefix-cache block-size bug #40696](https://github.com/vllm-project/vllm/issues/40696) · [Prefix caching for hybrid #26201](https://github.com/vllm-project/vllm/issues/26201) · [LLM Compressor FP8](https://developers.redhat.com/articles/2025/10/07/llm-compressor-080-extended-support-qwen3)
