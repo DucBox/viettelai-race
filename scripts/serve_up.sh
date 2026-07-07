@@ -56,9 +56,22 @@ if [[ "$MODE" == "native" ]]; then
   PIDFILE="serve/.vllm.pid"
   LOGFILE="serve/vllm.log"
   if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo ">> Stopping previous vllm serve (pid $(cat "$PIDFILE")) ..."
-    kill "$(cat "$PIDFILE")" 2>/dev/null || true
-    sleep 2
+    OLD_PID="$(cat "$PIDFILE")"
+    echo ">> Stopping previous vllm serve (pid $OLD_PID) ..."
+    kill "$OLD_PID" 2>/dev/null || true
+    # Wait for the process to actually exit (releasing its CUDA context/VRAM)
+    # instead of guessing a fixed sleep — matters when re-testing a tight
+    # GPU_MEM_UTIL, where leftover VRAM from the old process could make the
+    # new one OOM for a reason unrelated to the new config.
+    for _ in $(seq 1 30); do
+      kill -0 "$OLD_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      echo ">> Still alive after 30s — sending SIGKILL ..."
+      kill -9 "$OLD_PID" 2>/dev/null || true
+      sleep 2
+    fi
   fi
 
   echo ">> Starting 'vllm serve' natively (GPU_ID=$GPU_ID, CUDA_VISIBLE_DEVICES) ..."
