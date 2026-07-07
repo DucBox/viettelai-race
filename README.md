@@ -3,6 +3,10 @@
 Serve **Qwen/Qwen3.5-2B** on vLLM, fire test traffic, and view every metric that
 matters — **before** touching the production server or any optimization.
 
+📐 **[Architecture deep-dive (bilingual VI/EN, live page)](https://claude.ai/code/artifact/72530e47-ea0e-4cae-8e43-e1ea9595f46f)**
+— Gated DeltaNet vs. full attention, layer by layer, and how each property
+drives caching/quantization/serving. Source: `docs/qwen35-architecture.html`.
+
 > ⚠️ **Runs on a Linux + NVIDIA GPU box only.** This kit does not work on macOS /
 > Apple Silicon: vLLM needs CUDA, and Qwen3.5-2B is a hybrid *Gated DeltaNet +
 > attention* model whose kernels are CUDA-only. Use a small dev GPU for this step
@@ -55,7 +59,7 @@ aiperf/
   vendored clone of github.com/ai-dynamo/aiperf — source + docs reference (gitignored)
 docs/
   VIETTEL AI RACE.pdf         the problem statement
-  qwen35-architecture.html    bilingual architecture deep-dive
+  qwen35-architecture.html    bilingual architecture deep-dive (live: https://claude.ai/code/artifact/72530e47-ea0e-4cae-8e43-e1ea9595f46f)
 ```
 
 ## Running it
