@@ -19,6 +19,10 @@ bench/.venv/
 artifacts/
 **/artifacts/
 
+# serve_up.sh native-mode runtime state
+serve/.vllm.pid
+serve/vllm.log
+
 # misc
 .DS_Store
 __pycache__/

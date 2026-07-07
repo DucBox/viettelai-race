@@ -46,7 +46,7 @@ serve/
 scripts/
   00_list_gpus.sh      optional: list host GPUs if the default card (0) is busy
   01_check_model.sh    verify serve/models/<name>/ is complete; reports missing files, doesn't fetch
-  serve_up.sh          one command: check model → docker compose up → wait for healthy
+  serve_up.sh          one command: check model → serve (native or docker, auto-detected) → wait for healthy
   02_smoke_test.sh     one chat request → confirm inference works
   03_watch_metrics.sh  live tail of the metrics that matter (curl /metrics)
   04_inspect_arch.py   architecture facts straight from config.json
