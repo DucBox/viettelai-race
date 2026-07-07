@@ -32,8 +32,14 @@ while true; do
     echo "$raw" | grep -E "^vllm:($KEYS)" | grep -v '^#' | sort
     echo
     # Compute prefix cache hit rate from the two counters if present.
-    q=$(echo "$raw" | grep -E '^vllm:.*prefix_cache_queries' | grep -v '^#' | awk '{s+=$2} END{print s+0}')
-    h=$(echo "$raw" | grep -E '^vllm:.*prefix_cache_hits'    | grep -v '^#' | awk '{s+=$2} END{print s+0}')
+    # IMPORTANT: match only the "_total" counter, never "_created" — Prometheus
+    # client libraries emit a companion "<name>_created" series holding the
+    # Unix-epoch timestamp the counter was instantiated at (a huge number,
+    # ~1.7e9), not a count. A looser grep here silently sums that timestamp
+    # into the total and produces a nonsense hit-rate (e.g. a coincidental
+    # ~99%) — matched only "_total" fixes this.
+    q=$(echo "$raw" | grep -E '^vllm:[a-z_]*prefix_cache_queries_total' | grep -v '^#' | awk '{s+=$2} END{print s+0}')
+    h=$(echo "$raw" | grep -E '^vllm:[a-z_]*prefix_cache_hits_total'    | grep -v '^#' | awk '{s+=$2} END{print s+0}')
     if [[ "${q:-0}" != "0" ]]; then
       echo "  >> prefix cache hit rate = hits/queries = $h / $q = $(python3 -c "print(f'{$h/$q*100:.1f}%')")"
     else
