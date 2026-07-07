@@ -52,14 +52,20 @@ scripts/
   04_inspect_arch.py   architecture facts straight from config.json
   05_inspect_weights.py  per-tensor ground truth from the safetensors header
   06_module_tree.py / 06_module_tree_docker.sh   real nn.Module tree (via Docker py3.11)
+  07_per_request_report.py   per-user / per-turn table from AIPerf's raw output + full CSV
 bench/
   install_aiperf.sh    installs AIPerf from ../aiperf (vendored clone) or PyPI as fallback
-  run_aiperf_baseline.sh   drive load + print report (smoke | trace mode)
+  run_aiperf_baseline.sh   drive load + print report (smoke | trace | sessions | replay)
+  convert_trace_to_aiperf.py   convert the real trace to AIPerf's mooncake_trace format
+data/
+  trace-round1.jsonl         real competition trace (organizer-provided, gitignored)
+  trace-round1.aiperf.jsonl  converted replay input the bench actually fires (committed)
 aiperf/
   vendored clone of github.com/ai-dynamo/aiperf — source + docs reference (gitignored)
 docs/
-  VIETTEL AI RACE.pdf         the problem statement
-  qwen35-architecture.html    bilingual architecture deep-dive (live: https://claude.ai/code/artifact/72530e47-ea0e-4cae-8e43-e1ea9595f46f)
+  VIETTEL AI RACE.pdf              the problem statement
+  qwen35-architecture.html        bilingual architecture deep-dive (live: https://claude.ai/code/artifact/72530e47-ea0e-4cae-8e43-e1ea9595f46f)
+  trace-round1-data-description.md  schema + structure of the trace files
 ```
 
 ## Running it
@@ -110,13 +116,34 @@ loaded, tokenizer is fine, streaming path is fine.
 ./bench/install_aiperf.sh
 source bench/.venv/bin/activate
 
-./bench/run_aiperf_baseline.sh          # smoke (default): concurrency 4, 20 reqs
-MODE=trace ./bench/run_aiperf_baseline.sh   # competition-shaped: 20 sessions, ~15k in / 200 out
+./bench/run_aiperf_baseline.sh              # smoke (default): concurrency 4, 20 reqs
+MODE=trace    ./bench/run_aiperf_baseline.sh   # competition-*shaped* synthetic: 20 conc, ~15k in / 200 out
+MODE=sessions ./bench/run_aiperf_baseline.sh   # synthetic 20-user x 6-turn (growing shared prefix)
+MODE=replay   ./bench/run_aiperf_baseline.sh   # THE REAL TRACE: replays data/trace-round1.jsonl
 ```
+`MODE=replay` is the faithful benchmark: it replays the actual 120 competition
+requests (full conversation history baked into each) on the trace's own fixed
+timestamp schedule — no synthetic content. It auto-converts the trace via
+`bench/convert_trace_to_aiperf.py` on first run.
+
 Keep `./scripts/03_watch_metrics.sh` running in another terminal while this runs —
 you'll see `num_requests_running` jump and `kv_cache_usage_perc` climb. AIPerf
 prints a TTFT / ITL / throughput table and writes everything (including
 `server_metrics_export.*`) under `./artifacts/`.
+
+### 6. Per-request breakdown (per user / per turn)
+
+```bash
+./bench/.venv/bin/python scripts/07_per_request_report.py
+```
+
+The AIPerf console table only shows aggregates. This reads AIPerf's raw
+`profile_export.jsonl` + `server_metrics_export.jsonl` and prints one row per
+request — for `MODE=replay` it labels each as **(user, turn)** (user = req%20,
+turn = req//20), with arrival / start / end / queue timestamps, TTFT / TPOT /
+in / out / latency, per-request **prefix-cache hit** (`cached_tokens` from vLLM
+usage), and the nearest KV-cache / prefix scrape. It also dumps a full
+`per_request_report.csv` with every column.
 
 ## What to look at (mapped to the scoring)
 
@@ -145,11 +172,6 @@ let you read metrics, not to hit competition numbers. Real tuning happens next, 
 the production GPU.
 
 ## Next step (not this kit)
-Replay the actual `trace-round1.jsonl` by timestamp with AIPerf's fixed schedule:
-```bash
-aiperf profile --model qwen3.5-2b --url localhost:8000 --endpoint-type chat --streaming \
-  --tokenizer serve/models/qwen3.5-2b \
-  --input-file trace-round1.jsonl --custom-dataset-type mooncake_trace --fixed-schedule
-```
-Then build the internal ERS + GPQA scorers and start the optimization axes
+The real-trace replay is now in the kit (`MODE=replay` above). What's left:
+build the internal ERS + GPQA scorers and start the optimization axes
 (prefix-cache verification on the hybrid arch → FP8 → chunked prefill → CPU).
