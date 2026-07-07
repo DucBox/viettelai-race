@@ -38,6 +38,12 @@ if [[ "$MODE" == "replay" ]]; then
   # and thus the natural concurrency). max_tokens/temperature/seed travel inside
   # the converted file, so we don't force them here (and deliberately no
   # ignore_eos — the model stops at its real EOS, which is what gets scored).
+  #
+  # --use-server-token-count auto-enables stream_options.include_usage, so vLLM
+  # returns usage (prompt_tokens + prompt_tokens_details.cached_tokens) per
+  # request. That fills the report's in_tok and, crucially, the per-request
+  # prefix-cache-hit columns (cache_rd / hit%) — AIPerf skips input tokenization
+  # in mooncake_trace `messages` mode, so without this those columns are blank.
   TRACE_IN="${TRACE_IN:-data/trace-round1.jsonl}"
   REPLAY_FILE="${REPLAY_FILE:-data/trace-round1.aiperf.jsonl}"
 
@@ -61,6 +67,7 @@ if [[ "$MODE" == "replay" ]]; then
     --input-file "$REPLAY_FILE" \
     --custom-dataset-type mooncake_trace \
     --fixed-schedule \
+    --use-server-token-count \
     --server-metrics-formats json csv jsonl \
     --random-seed 42
 
