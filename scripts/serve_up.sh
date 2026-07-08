@@ -42,6 +42,14 @@ case "$MODEL_DIR" in
   *) MODEL_DIR_ABS="$(cd "serve/$MODEL_DIR" && pwd)" ;;
 esac
 
+# Extra vLLM flags from .env (EXTRA_VLLM_ARGS), split into an argv array and
+# appended verbatim to `vllm serve` below — sweep any flag without touching this
+# script. e.g. EXTRA_VLLM_ARGS="--mamba-cache-mode all --enable-chunked-prefill"
+read -ra EXTRA_VLLM_ARGV <<< "${EXTRA_VLLM_ARGS:-}"
+if [[ ${#EXTRA_VLLM_ARGV[@]} -gt 0 ]]; then
+  echo ">> Extra vLLM args: ${EXTRA_VLLM_ARGV[*]}"
+fi
+
 if command -v vllm >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
   MODE="native"
 else
@@ -82,6 +90,7 @@ if [[ "$MODE" == "native" ]]; then
       --gpu-memory-utilization "$GPU_MEM_UTIL" \
       --max-num-seqs "$MAX_NUM_SEQS" \
       --enable-prefix-caching \
+      ${EXTRA_VLLM_ARGV[@]+"${EXTRA_VLLM_ARGV[@]}"} \
       > "$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
   LOGS_CMD="tail -f $LOGFILE"
@@ -106,7 +115,8 @@ else
       -v "$MODEL_DIR_ABS:$MODEL_PATH:ro")
     VLLM_ARGS=("$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
       --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL"
-      --max-num-seqs "$MAX_NUM_SEQS" --enable-prefix-caching)
+      --max-num-seqs "$MAX_NUM_SEQS" --enable-prefix-caching
+      ${EXTRA_VLLM_ARGV[@]+"${EXTRA_VLLM_ARGV[@]}"})
 
     # Attempt 1: modern `--gpus` flag (goes through CDI vendor discovery in
     # recent Docker versions). Known to fail with "failed to discover GPU
