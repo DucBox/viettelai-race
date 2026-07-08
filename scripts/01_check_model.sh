@@ -10,7 +10,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Preserve a caller-provided MODEL_DIR (e.g. serve_up.sh forwarding a
+# 11_multi_bench.sh row override) across the .env source below — same class of
+# bug fixed in serve_up.sh / 10_bench_e2e.sh / run_aiperf_baseline.sh. Without
+# this, a row testing weights at a different MODEL_DIR would have this script
+# silently check serve/.env's own default directory instead — reporting the
+# WRONG directory's completeness.
+_pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
+eval "$_pre_env_declare"
 MODEL_DIR="${MODEL_DIR:-serve/models/qwen3.5-2b}"
 # .env's MODEL_DIR is relative to serve/ (docker-compose context) — normalize
 # so this script works whether it's given as "./models/x", "serve/models/x",
