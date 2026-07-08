@@ -179,11 +179,13 @@ for meta_path in sorted(glob.glob(os.path.join(out, "**", "exp_meta.json"), recu
     meta = json.load(open(meta_path))
     r = {"name": meta["name"], "flags": meta["extra_vllm_args"] or "-",
          "rep": meta.get("rep", 1), "status": "ok", "acc": None, "unparsed": None,
-         "ers": None, "s_ttft": None, "s_tpot": None, "f": None, "score": None}
+         "ers": None, "s_ttft": None, "s_tpot": None, "f": None, "score": None,
+         "kv_max": None}
     if os.path.exists(os.path.join(exp, "FAILED")):
         r["status"] = "FAILED"
     sc_p = os.path.join(exp, "run", "score_summary.json")
     gp_p = os.path.join(exp, "run", "gpqa", "summary.json")
+    smx_p = os.path.join(exp, "run", "server_metrics_export.jsonl")
     if os.path.exists(sc_p):
         sc = json.load(open(sc_p))
         r.update(ers=sc.get("ers"), s_ttft=sc.get("mean_s_ttft"),
@@ -193,6 +195,32 @@ for meta_path in sorted(glob.glob(os.path.join(out, "**", "exp_meta.json"), recu
         gp = json.load(open(gp_p))
         r["acc"] = gp.get("accuracy", r["acc"])
         r["unparsed"] = gp.get("unparsed")
+    if os.path.exists(smx_p):
+        # Peak (not mean) kv_cache_usage_perc across the FULL server scrape
+        # time series (~every 333ms for the whole run) — NOT from
+        # per_request_report.csv's kv_pct column, which only samples the
+        # nearest scrape to each REQUEST'S END (~120 points here vs ~93+
+        # continuous scrapes, but more importantly: the true peak can fall
+        # between request completions, e.g. mid-burst while several long
+        # prefills are in flight and none has finished yet — the per-request
+        # column would silently never see that moment). This is the number
+        # that actually says "how close did we get to evicting/preempting".
+        kv_vals = []
+        with open(smx_p) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for entry in rec.get("metrics", {}).get("vllm:kv_cache_usage_perc", []):
+                    v = entry.get("value")
+                    if v is not None:
+                        kv_vals.append(float(v))
+        if kv_vals:
+            r["kv_max"] = max(kv_vals)
     rows.append(r)
 
 if not rows:
@@ -228,22 +256,25 @@ for name, reps in by_name.items():
     ok = [r for r in reps if r["status"] == "ok"]
     n_fail = len(reps) - len(ok)
     entry = {"name": name, "flags": reps[0]["flags"], "n": len(reps), "n_fail": n_fail}
-    for key in ("acc", "ers", "s_ttft", "s_tpot", "score"):
+    for key in ("acc", "ers", "s_ttft", "s_tpot", "score", "kv_max"):
         vals = [r[key] for r in ok if r[key] is not None]
         entry[key + "_mean"] = mean(vals)
         entry[key + "_std"] = stdev(vals)
     agg.append(entry)
 
 multi_rep = any(a["n"] > 1 for a in agg)
-hdr = ["exp", "n", "acc", "ERS", "s_ttft", "s_tpot", "SCORE", "flags"]
-w = [16, 3, 16, 16, 9, 9, 16, 28]
+hdr = ["exp", "n", "acc", "ERS", "s_ttft", "s_tpot", "SCORE", "KV%peak", "flags"]
+w = [16, 3, 16, 16, 9, 9, 16, 12, 28]
 line = "  ".join(h.ljust(wi) for h, wi in zip(hdr, w))
 print(line); print("-" * len(line))
 
-def cell(entry, key, d=3):
+def cell(entry, key, d=3, pct=False):
     m, s = entry[key + "_mean"], entry[key + "_std"]
     if m is None:
         return "-"
+    if pct:
+        m, s = m * 100, (s * 100 if s is not None else None)
+        d = 1
     if s is None:
         return f"{m:.{d}f}" + ("" if entry["n"] == 1 else " (n/a)")
     return f"{m:.{d}f}±{s:.{d}f}"
@@ -251,7 +282,8 @@ def cell(entry, key, d=3):
 for a in sorted(agg, key=lambda a: (a["score_mean"] is None, -(a["score_mean"] or 0))):
     name_disp = a["name"] + (f" [{a['n_fail']} FAILED]" if a["n_fail"] else "")
     cells = [name_disp, str(a["n"]), cell(a, "acc"), cell(a, "ers", 4),
-             cell(a, "s_ttft"), cell(a, "s_tpot"), cell(a, "score", 2), a["flags"]]
+             cell(a, "s_ttft"), cell(a, "s_tpot"), cell(a, "score", 2),
+             cell(a, "kv_max", pct=True), a["flags"]]
     print("  ".join(str(c).ljust(wi) for c, wi in zip(cells, w)))
 
 if multi_rep:
