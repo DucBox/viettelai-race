@@ -30,6 +30,9 @@ Usage:
     ./bench/.venv/bin/python scripts/08_ers_score.py
     ./bench/.venv/bin/python scripts/08_ers_score.py artifacts/<run>
     ./bench/.venv/bin/python scripts/08_ers_score.py --accuracy 0.36
+    ./bench/.venv/bin/python scripts/08_ers_score.py artifacts/<run> \
+        --accuracy-file artifacts/<run>/gpqa/summary.json   # accuracy from scripts/09
+Writes score_summary.json into the run dir (machine-readable rollup).
 """
 import glob
 import json
@@ -47,7 +50,7 @@ USERS_DEFAULT = 20
 
 
 def parse_args(argv):
-    run_dir, accuracy, users = None, None, USERS_DEFAULT
+    run_dir, accuracy, users, acc_file = None, None, USERS_DEFAULT, None
     args = argv[1:]
     i = 0
     while i < len(args):
@@ -56,11 +59,19 @@ def parse_args(argv):
             accuracy = float(args[i + 1]); i += 2; continue
         if a.startswith("--accuracy="):
             accuracy = float(a.split("=", 1)[1]); i += 1; continue
+        if a == "--accuracy-file":
+            acc_file = args[i + 1]; i += 2; continue
+        if a.startswith("--accuracy-file="):
+            acc_file = a.split("=", 1)[1]; i += 1; continue
         if a == "--users":
             users = int(args[i + 1]); i += 2; continue
         if a.startswith("--users="):
             users = int(a.split("=", 1)[1]); i += 1; continue
         run_dir = a; i += 1
+    # --accuracy-file: pull the measured accuracy from a scripts/09 summary.json.
+    if accuracy is None and acc_file:
+        with open(acc_file) as f:
+            accuracy = float(json.load(f)["accuracy"])
     return run_dir, accuracy, users
 
 
@@ -147,6 +158,16 @@ def main():
     mean_s_tpot = sum(x["s_tpot"] for x in rows) / n if n else 0.0
     f_delta, assumed = accuracy_gate(accuracy)
     final = 100.0 * ers * f_delta
+
+    # Machine-readable rollup next to the run — the e2e report reads this.
+    with open(os.path.join(run_dir, "score_summary.json"), "w") as fh:
+        json.dump({
+            "run_dir": run_dir, "requests": n, "failed": n_failed,
+            "ers": ers, "mean_s_ttft": mean_s_ttft, "mean_s_tpot": mean_s_tpot,
+            "accuracy": accuracy, "accuracy_assumed": assumed,
+            "delta": (None if accuracy is None else BASELINE_ACC - accuracy),
+            "f_delta": f_delta, "score": final,
+        }, fh, indent=2)
 
     print(f"run: {run_dir}")
     print(f"params (round 1): TTFT F={F_TTFT:.0f}/C={C_TTFT:.0f}ms  "
