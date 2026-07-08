@@ -32,7 +32,25 @@
 #   GPQA_LIMIT, GPQA_CONCURRENCY, GPQA_MAX_TOKENS, GPQA_ARGS   forwarded to step 3
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Preserve a caller-provided EXTRA_VLLM_ARGS (e.g. from 11_multi_bench.sh's
+# per-row `env EXTRA_VLLM_ARGS=... bash scripts/10_bench_e2e.sh`) across the
+# .env source below. `${VAR+x}` is true if VAR is SET at all, even to "" — that
+# distinguishes "caller explicitly chose no extra flags for this row" (must win)
+# from "nobody touched this var" (let .env's value apply, normal solo-run case).
+# Without this, serve/.env's own `EXTRA_VLLM_ARGS=` line (shipped, empty, by
+# .env.example) unconditionally overwrites whatever the caller passed in —
+# silently making every row in a sweep serve the SAME config.
+if [[ -n "${EXTRA_VLLM_ARGS+x}" ]]; then
+  _caller_extra_vllm_args="$EXTRA_VLLM_ARGS"
+  _has_caller_extra_vllm_args=1
+else
+  _has_caller_extra_vllm_args=0
+fi
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
+if [[ "$_has_caller_extra_vllm_args" == "1" ]]; then
+  EXTRA_VLLM_ARGS="$_caller_extra_vllm_args"
+fi
 
 # Activate the bench venv so `aiperf` is on PATH; its python runs the scorers too
 # (07/08/09 are stdlib-only, so any python3 works — we just reuse this one).
