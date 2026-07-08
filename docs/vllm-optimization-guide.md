@@ -83,7 +83,7 @@ KV cache cũng chỉ là số — lưu BF16 (2 byte) hay **FP8 (1 byte)** → **
 mỗi token cached**, lưu được nhiều token hơn → ít evict, giữ prefix lâu hơn.
 
 **Cách dùng (vLLM):**
-- `--kv-cache-dtype fp8` (mặc định `fp8_e4m3`; có `fp8_e5m2`). `auto` = giữ nguyên dtype model.
+- `--kv-cache-dtype fp8` (= `fp8_e4m3`; enum v0.22.1: `auto, fp8, fp8_e4m3, fp8_e5m2, fp8_per_token_head, int8_per_token_head, nvfp4, ...`). `auto` = giữ nguyên dtype model.
 - `--kv-cache-dtype-skip-layers <...>` : giữ một số layer ở BF16 (vd sliding-window). Model này **không có sliding window** nên ít dùng.
 - `--calculate-kv-scales` : tự ước lượng scale lúc warmup. Mặc định scale=1.0 (uncalibrated). Muốn chuẩn hơn → calibrate bằng **llm-compressor** (per-tensor / per-head scale).
 
@@ -174,7 +174,7 @@ biến thể của bug #43587 → đổi sang `all` mode / chỉnh block-size.
 - [ ] **Warmup lúc boot** bằng request tự tạo (**KHÔNG dùng nội dung trace** — luật cấm pre-compute) để compile CUDA graph + nóng allocator trước healthcheck.
 
 ### 🟢 Decode/TPOT (ưu tiên thấp — đang ổn)
-- [ ] Speculative decoding qua **MTP head**: `--speculative-config` / `--spec-method` / `--spec-tokens`. CHỈ khi đo TPOT thực >20ms (đạt Floor rồi thì không thêm điểm). Rủi ro.
+- [ ] Speculative decoding qua **MTP head**: **`--spec-method qwen3_5_mtp`** (có sẵn cho đúng model này ở v0.22.1) / `--spec-tokens`. CHỈ khi đo TPOT thực >20ms (đạt Floor rồi thì không thêm điểm). Rủi ro.
 
 ---
 
@@ -294,8 +294,8 @@ Với FP8, "xử lý outlier" gói gọn trong 3 thứ nhẹ:
 
 ## 5. THAM CHIẾU CỜ vLLM ĐẦY ĐỦ (từ source `arg_utils.py`)
 
-> ⚠️ Tập cờ thay đổi theo version. **Verify bằng `vllm serve --help` trên đúng image
-> của bạn** (baseline BTC: `vllm/vllm-openai:v0.22.1`). Đánh dấu: 🎯 = đang để ý cho bài này.
+> ✅ **Đã verify với `vllm serve --help` trên image thật `v0.22.1`** — mọi cờ 🎯 dưới
+> đây đều tồn tại ở version đó. Đánh dấu: 🎯 = đang để ý cho bài này.
 
 ### (1) Model & loading
 `--model` · `--tokenizer` · `--tokenizer-mode` · `--trust-remote-code` · `--dtype` 🎯(bf16/auto) · `--seed` · `--max-model-len` 🎯 · `--served-model-name` 🎯 · `--load-format` 🎯 · `--download-dir` · `--revision` · `--hf-config-path` · `--config-format` · `--model-impl` · `--override-attention-dtype` · `--override-generation-config` · `--generation-config` · `--safetensors-load-strategy` / `--safetensors-prefetch-num-threads` / `--safetensors-prefetch-block-size` 🎯(tốc độ load → startup) · `--ignore-patterns` · `--model-weights` · `--hf-overrides` · `--skip-tokenizer-init`
@@ -315,14 +315,14 @@ Với FP8, "xử lý outlier" gói gọn trong 3 thứ nhẹ:
 ### (6) Quantization (weight)
 `--quantization/-q` 🎯 · `--quantization-config` 🎯 · `--allow-deprecated-quantization`
 
-### (7) CUDA graphs & compilation
-`--enforce-eager` 🎯(TẮT nó để giữ CUDA graph) · `--cudagraph-capture-sizes` 🎯 · `--max-cudagraph-capture-size` 🎯 · `--compilation-config/-cc` 🎯 · `--optimization-level` · `--performance-mode`
+### (7) CUDA graphs & compilation & preset cấp cao
+`--enforce-eager` 🎯(TẮT nó để giữ CUDA graph) · `--cudagraph-capture-sizes` 🎯 · `--max-cudagraph-capture-size` 🎯 · `--compilation-config/-cc` 🎯 · **`--performance-mode {balanced,interactivity,throughput}`** 🎯(preset 1-cờ — thử `throughput`) · `--optimization-level` 🎯 · `--async-scheduling` 🎯
 
 ### (8) Attention & kernels
 `--attention-backend` 🎯 · `--attention-config/-ac` · `--enable-flashinfer-autotune` 🎯 · `--linear-backend` 🎯(GDN linear) · `--ir-op-priority` · `--kernel-config`
 
 ### (9) Mamba / GDN (riêng arch này)
-`--mamba-backend` 🎯(triton/…) · `--gdn-prefill-backend` 🎯(flashinfer/triton) · `--mamba-cache-dtype` 🎯 · `--mamba-ssm-cache-dtype` 🎯 · `--mamba-block-size` 🎯 · `--mamba-cache-mode` 🎯 · `--enable-mamba-cache-stochastic-rounding`
+`--gdn-prefill-backend {flashinfer,triton,cutedsl}` 🎯 (default `triton` — thử flashinfer/cutedsl) · `--mamba-cache-mode {align,all,none}` 🎯 (default `align`; thử `all`; `none`=tắt) · `--mamba-backend` 🎯 · `--mamba-cache-dtype {auto,bfloat16,float16,float32}` 🎯 · `--mamba-ssm-cache-dtype` 🎯 · `--mamba-block-size` 🎯 · `--enable-mamba-cache-stochastic-rounding`
 
 ### (10) Speculative decoding (MTP)
 `--speculative-config/-sc` 🎯 · `--spec-method` 🎯 · `--spec-model` · `--spec-tokens` 🎯
@@ -331,7 +331,7 @@ Với FP8, "xử lý outlier" gói gọn trong 3 thứ nhẹ:
 `--language-model-only` 🎯(bỏ xử lý multimodal) · `--limit-mm-per-prompt` 🎯 · `--skip-mm-profiling` 🎯 · `--mm-encoder-*` (nhiều cờ encoder) · `--media-io-kwargs` · `--mm-processor-kwargs`
 
 ### (12) Logging / API / observability
-`--disable-log-stats` 🎯 · `--kv-cache-metrics` 🎯 / `--kv-cache-metrics-sample` · `--cudagraph-metrics` · `--otlp-traces-endpoint` · `--collect-detailed-traces` · `--enable-logging-iteration-details` · `--show-hidden-metrics-for-version` · `--enable-mfu-metrics`
+`--disable-log-stats` 🎯 · `--enable-log-requests`/`--no-enable-log-requests` 🎯(mặc định off — giữ off cho nhẹ CPU) · `--disable-uvicorn-access-log` 🎯 · **`--enable-force-include-usage`** 🎯(server tự nhét `usage` vào response → `cache_rd/hit%` hiện kể cả không cần `--use-server-token-count` bên AIPerf) · `--kv-cache-metrics` 🎯 / `--kv-cache-metrics-sample` · `--cudagraph-metrics` · `--otlp-traces-endpoint` · `--collect-detailed-traces` · `--enable-logging-iteration-details` · `--enable-mfu-metrics`
 
 ### (13) Misc
 `--max-logprobs` 🎯 · `--disable-cascade-attn` 🎯 · `--disable-sliding-window` (n/a) · `--enable-sleep-mode` · `--enable-cumem-allocator` · `--shutdown-timeout` · `--tokens-only` · `--enable-prompt-embeds` · `--logits-processors` · `--kv-transfer-config` / `--kv-events-config` (disaggregated — n/a single GPU) · `--additional-config`
