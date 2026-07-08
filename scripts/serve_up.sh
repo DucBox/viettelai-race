@@ -25,23 +25,17 @@ cd "$(dirname "$0")/.."
 ./scripts/01_check_model.sh
 echo
 
-# Preserve a caller-provided EXTRA_VLLM_ARGS (e.g. from 11_multi_bench.sh's
-# per-row sweep, or 10_bench_e2e.sh forwarding it) across the .env source below.
-# `${VAR+x}` is true if the var is SET at all, even to "" — that distinguishes
-# "caller explicitly chose these flags for this run" (must win) from "nobody
-# touched this var" (let .env's own value apply, the normal standalone case).
-# Without this, serve/.env's own `EXTRA_VLLM_ARGS=` line (shipped, empty, by
-# .env.example) unconditionally overwrites whatever the caller passed in.
-if [[ -n "${EXTRA_VLLM_ARGS+x}" ]]; then
-  _caller_extra_vllm_args="$EXTRA_VLLM_ARGS"
-  _has_caller_extra_vllm_args=1
-else
-  _has_caller_extra_vllm_args=0
-fi
+# Preserve EVERY caller-provided env var (e.g. 11_multi_bench.sh's per-row
+# `env EXTRA_VLLM_ARGS=... GPU_MEM_UTIL=... ...`, or 10_bench_e2e.sh forwarding
+# them) across the .env source below. serve/.env ships REAL non-empty defaults
+# for GPU_MEM_UTIL, MAX_NUM_SEQS, MODEL_DIR, etc. (only EXTRA_VLLM_ARGS ships
+# empty) — sourcing it is a plain assignment that unconditionally overwrites
+# ANY of these the caller set, regardless of variable name. Snapshotting every
+# exported var beforehand and re-declaring them after restores exactly what the
+# caller passed in, while untouched vars still pick up .env's value normally.
+_pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
-if [[ "$_has_caller_extra_vllm_args" == "1" ]]; then
-  EXTRA_VLLM_ARGS="$_caller_extra_vllm_args"
-fi
+eval "$_pre_env_declare"
 IMAGE="${IMAGE:-vllm/vllm-openai:v0.22.1}"
 GPU_ID="${GPU_ID:-0}"
 MODEL_DIR="${MODEL_DIR:-./models/qwen3.5-2b}"

@@ -33,24 +33,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Preserve a caller-provided EXTRA_VLLM_ARGS (e.g. from 11_multi_bench.sh's
-# per-row `env EXTRA_VLLM_ARGS=... bash scripts/10_bench_e2e.sh`) across the
-# .env source below. `${VAR+x}` is true if VAR is SET at all, even to "" — that
-# distinguishes "caller explicitly chose no extra flags for this row" (must win)
-# from "nobody touched this var" (let .env's value apply, normal solo-run case).
-# Without this, serve/.env's own `EXTRA_VLLM_ARGS=` line (shipped, empty, by
-# .env.example) unconditionally overwrites whatever the caller passed in —
-# silently making every row in a sweep serve the SAME config.
-if [[ -n "${EXTRA_VLLM_ARGS+x}" ]]; then
-  _caller_extra_vllm_args="$EXTRA_VLLM_ARGS"
-  _has_caller_extra_vllm_args=1
-else
-  _has_caller_extra_vllm_args=0
-fi
+# Preserve EVERY caller-provided env var (e.g. 11_multi_bench.sh's per-row
+# `env EXTRA_VLLM_ARGS=... GPU_MEM_UTIL=... bash scripts/10_bench_e2e.sh`, or
+# any var a user exports before running this directly) across the .env source
+# below. serve/.env ships REAL non-empty defaults for GPU_MEM_UTIL, MAX_NUM_SEQS,
+# MODEL_DIR, etc. (only EXTRA_VLLM_ARGS ships empty) — sourcing it is a plain
+# assignment that unconditionally overwrites ANY of these the caller set,
+# regardless of variable name. Snapshotting every exported var beforehand and
+# re-declaring them after restores exactly what the caller passed in, while
+# untouched vars still pick up .env's value normally (they were never in the
+# pre-snapshot, so the restore doesn't touch them).
+_pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
-if [[ "$_has_caller_extra_vllm_args" == "1" ]]; then
-  EXTRA_VLLM_ARGS="$_caller_extra_vllm_args"
-fi
+eval "$_pre_env_declare"
 
 # Activate the bench venv so `aiperf` is on PATH; its python runs the scorers too
 # (07/08/09 are stdlib-only, so any python3 works — we just reuse this one).
