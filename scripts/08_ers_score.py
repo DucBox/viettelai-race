@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Internal ERS scorer — reproduce the competition score from an AIPerf run.
+"""Internal ERS scorer — reproduce the latency half of the competition score
+from an AIPerf run.
 
 The BTC formula (round 1, from docs/VIETTEL AI RACE.pdf §1.3):
 
@@ -17,21 +18,19 @@ The BTC formula (round 1, from docs/VIETTEL AI RACE.pdf §1.3):
       w = 0.5 (TTFT and TPOT weighted equally)
       TPOT here = the request's MEAN inter-token latency.
 
-  f(Δ) — accuracy gate, scored separately on 100 GPQA-Diamond questions:
-      Δ = 0.40 - accuracy;  f=1 if Δ≤0.10, 0 if Δ≥0.16, linear in between.
-  This script assumes f(Δ)=1 unless you pass --accuracy (the accuracy gate is a
-  separate GPQA harness, not something AIPerf measures).
+This script deliberately measures ONLY ERS (the latency factor). Accuracy /
+f(Δ) is a separate, independent concern — measured with its own harness
+(scripts/09_gpqa_accuracy.py or scripts/12_gpqa_lmeval.sh), run and reported
+on its own. Combining the two into a final Score is a manual step, not
+something this pipeline does automatically.
 
 We read the SAME artifacts as the per-request report: time_to_first_token and
 inter_token_latency per request from profile_export.jsonl. So after any
-`MODE=replay` run you get the projected Score immediately — no leaderboard wait.
+`MODE=replay` run you get ERS immediately — no leaderboard wait.
 
 Usage:
     ./bench/.venv/bin/python scripts/08_ers_score.py
     ./bench/.venv/bin/python scripts/08_ers_score.py artifacts/<run>
-    ./bench/.venv/bin/python scripts/08_ers_score.py --accuracy 0.36
-    ./bench/.venv/bin/python scripts/08_ers_score.py artifacts/<run> \
-        --accuracy-file artifacts/<run>/gpqa/summary.json   # accuracy from scripts/09
 Writes score_summary.json into the run dir (machine-readable rollup).
 """
 import glob
@@ -44,35 +43,21 @@ F_TTFT, C_TTFT = 100.0, 1500.0      # ms
 F_TPOT, C_TPOT = 20.0, 45.0         # ms
 GAMMA = 2.0
 W = 0.5                             # weight on s_ttft (1-W on s_tpot)
-BASELINE_ACC = 0.40                # BF16 reference accuracy
-GATE_FULL, GATE_ZERO = 0.10, 0.16  # Δ thresholds for f(Δ)
 USERS_DEFAULT = 20
 
 
 def parse_args(argv):
-    run_dir, accuracy, users, acc_file = None, None, USERS_DEFAULT, None
+    run_dir, users = None, USERS_DEFAULT
     args = argv[1:]
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--accuracy":
-            accuracy = float(args[i + 1]); i += 2; continue
-        if a.startswith("--accuracy="):
-            accuracy = float(a.split("=", 1)[1]); i += 1; continue
-        if a == "--accuracy-file":
-            acc_file = args[i + 1]; i += 2; continue
-        if a.startswith("--accuracy-file="):
-            acc_file = a.split("=", 1)[1]; i += 1; continue
         if a == "--users":
             users = int(args[i + 1]); i += 2; continue
         if a.startswith("--users="):
             users = int(a.split("=", 1)[1]); i += 1; continue
         run_dir = a; i += 1
-    # --accuracy-file: pull the measured accuracy from a scripts/09 summary.json.
-    if accuracy is None and acc_file:
-        with open(acc_file) as f:
-            accuracy = float(json.load(f)["accuracy"])
-    return run_dir, accuracy, users
+    return run_dir, users
 
 
 def find_run_dir(explicit):
@@ -105,19 +90,8 @@ def component(x, F, C):
     return s ** GAMMA
 
 
-def accuracy_gate(accuracy):
-    if accuracy is None:
-        return 1.0, True  # assumed pass
-    delta = BASELINE_ACC - accuracy
-    if delta <= GATE_FULL:
-        return 1.0, False
-    if delta >= GATE_ZERO:
-        return 0.0, False
-    return (GATE_ZERO - delta) / (GATE_ZERO - GATE_FULL), False
-
-
 def main():
-    explicit, accuracy, users = parse_args(sys.argv)
+    explicit, users = parse_args(sys.argv)
     run_dir = find_run_dir(explicit)
     requests = load_jsonl(os.path.join(run_dir, "profile_export.jsonl"))
     if not requests:
@@ -156,17 +130,12 @@ def main():
     ers = sum(x["score"] for x in rows) / n if n else 0.0
     mean_s_ttft = sum(x["s_ttft"] for x in rows) / n if n else 0.0
     mean_s_tpot = sum(x["s_tpot"] for x in rows) / n if n else 0.0
-    f_delta, assumed = accuracy_gate(accuracy)
-    final = 100.0 * ers * f_delta
 
-    # Machine-readable rollup next to the run — the e2e report reads this.
+    # Machine-readable rollup next to the run — 11_multi_bench.sh reads this.
     with open(os.path.join(run_dir, "score_summary.json"), "w") as fh:
         json.dump({
             "run_dir": run_dir, "requests": n, "failed": n_failed,
             "ers": ers, "mean_s_ttft": mean_s_ttft, "mean_s_tpot": mean_s_tpot,
-            "accuracy": accuracy, "accuracy_assumed": assumed,
-            "delta": (None if accuracy is None else BASELINE_ACC - accuracy),
-            "f_delta": f_delta, "score": final,
         }, fh, indent=2)
 
     print(f"run: {run_dir}")
@@ -175,14 +144,8 @@ def main():
     print()
     print(f"requests: {n}   failed/empty (0 pts): {n_failed}")
     print(f"mean s_ttft = {mean_s_ttft:.3f}    mean s_tpot = {mean_s_tpot:.3f}")
-    print(f"ERS = {ers:.4f}")
-    if assumed:
-        print(f"f(Δ) = {f_delta:.3f}   (ASSUMED — pass --accuracy <acc> to apply the GPQA gate)")
-    else:
-        delta = BASELINE_ACC - accuracy
-        print(f"f(Δ) = {f_delta:.3f}   (accuracy={accuracy:.3f}, Δ={delta:.3f})")
     print("-" * 52)
-    print(f"SCORE = 100 × ERS × f(Δ) = {final:.2f}")
+    print(f"ERS = {ers:.4f}")
 
     # Per-turn breakdown — shows exactly where points are won/lost (cold-start
     # turn 0 vs cached later turns). Only meaningful for the trace replay.
@@ -205,9 +168,9 @@ def main():
                   f"{avg('score', grp):>6.3f} {sum(1 for x in grp if x['failed']):>4}")
 
     print()
-    print("Note: ERS averages over ALL requests (failures count as 0). f(Δ) is the")
-    print("independent accuracy gate (100 GPQA-Diamond Qs) — measure it separately and")
-    print("pass --accuracy; a real Score needs both cheap latency AND accuracy ≥ ~0.30.")
+    print("Note: ERS averages over ALL requests (failures count as 0). This is the")
+    print("LATENCY factor only — accuracy/f(Δ) is measured separately (scripts/09 or")
+    print("scripts/12) and is not combined into a Score here.")
 
 
 if __name__ == "__main__":
