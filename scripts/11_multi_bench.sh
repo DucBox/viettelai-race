@@ -16,16 +16,27 @@
 # NOTE: fields are separated by a TAB, not spaces (EXTRA_VLLM_ARGS itself has
 # spaces). In most editors a literal tab works; here we spell rows with $'\t'.
 #
-# Each row's outputs land in artifacts/multibench/<ts>/<name>/:
+# Each row's outputs land in artifacts/multibench/<ts>/<name>/ (or .../<name>/rep<N>/
+# when REPEATS>1 — see below):
 #   console.log            full terminal output (the 2 AIPerf tables + 07 table live here)
 #   run/                   the AIPerf run dir: profile_export.jsonl, server_metrics_export.*,
 #                          per_request_report.csv (07), gpqa/summary.json, score_summary.json
 #   exp_meta.json          {name, extra_vllm_args, extra_env}
-# Plus a top-level summary.csv + printed comparison table across all rows.
+# Plus a top-level summary.csv (one row per rep) + printed comparison table.
 #
-# Env: MODE (default replay), GPQA_LIMIT / GPQA_CONCURRENCY / GPQA_MAX_TOKENS,
-#      URL, SERVED_MODEL_NAME — forwarded to every row so the comparison is
-#      apples-to-apples.
+# WHY REPEAT: a single cold-restart run is NOISY (GPU boost-clock ramp-up, OS/
+# scheduling jitter, ~333ms server-metrics scrape granularity) — comparing two
+# configs from ONE run each cannot tell a real effect from noise. Set REPEATS=3
+# (or more) to run every row that many times; the summary then reports
+# mean±stddev per config so you can see whether a difference is bigger than the
+# noise floor. Repeats are INTERLEAVED (rep1: row1,row2,...  rep2: row1,row2,...)
+# rather than blocked (row1×3, row2×3, ...) so any drift over the session
+# (thermal, background load) hits every config equally instead of biasing
+# whichever one happened to run first or last.
+#
+# Env: MODE (default replay), REPEATS (default 1), GPQA_LIMIT / GPQA_CONCURRENCY
+#      / GPQA_MAX_TOKENS, URL, SERVED_MODEL_NAME — forwarded to every row so the
+#      comparison is apples-to-apples.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -71,24 +82,35 @@ if [[ -n "$_env_extra_vllm_args" ]]; then
 fi
 echo ">> serve/.env EXTRA_VLLM_ARGS check: empty/absent — OK, per-row flags will apply"
 
+REPEATS="${REPEATS:-1}"
+
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="artifacts/multibench/$TS"
 mkdir -p "$OUT"
 echo ">> multi-bench $TS  ($MODE)  ->  $OUT"
-echo ">> ${#EXPERIMENTS[@]} experiments"
+echo ">> ${#EXPERIMENTS[@]} experiments  ×  REPEATS=$REPEATS"
 
 n=0
+total=$(( ${#EXPERIMENTS[@]} * REPEATS ))
+# Outer loop = rep, inner loop = row -> INTERLEAVED order (rep1: all rows, then
+# rep2: all rows, ...) so session-wide drift (thermal, background load) can't
+# bias one config vs another the way a blocked order (row1×N, row2×N, ...) would.
+for rep in $(seq 1 "$REPEATS"); do
 for row in "${EXPERIMENTS[@]}"; do
   # split on tab into name / args / extra-env
   IFS=$'\t' read -r name args extra <<<"$row"
   name="${name## }"; name="${name%% }"
   [[ -z "$name" || "$name" == \#* ]] && continue
   n=$((n + 1))
-  EXPDIR="$OUT/$name"
+  if [[ "$REPEATS" -gt 1 ]]; then
+    EXPDIR="$OUT/$name/rep$rep"
+  else
+    EXPDIR="$OUT/$name"
+  fi
   mkdir -p "$EXPDIR"
 
-  printf '\n\033[1m########## EXP %d/%d: %s ##########\033[0m\n' \
-    "$n" "${#EXPERIMENTS[@]}" "$name"
+  printf '\n\033[1m########## EXP %d/%d: %s (rep %d/%d) ##########\033[0m\n' \
+    "$n" "$total" "$name" "$rep" "$REPEATS"
   echo ">> EXTRA_VLLM_ARGS = ${args:-<none>}"
   echo ">> extra env       = ${extra:-<none>}"
 
@@ -101,10 +123,10 @@ for row in "${EXPERIMENTS[@]}"; do
   [[ -n "${GPQA_MAX_TOKENS:-}" ]]  && EXP_ENV+=(GPQA_MAX_TOKENS="$GPQA_MAX_TOKENS")
 
   # exp_meta.json (record the exact config for the aggregate)
-  python3 - "$EXPDIR/exp_meta.json" "$name" "$args" "$extra" <<'PY'
+  python3 - "$EXPDIR/exp_meta.json" "$name" "$args" "$extra" "$rep" <<'PY'
 import json, sys
 json.dump({"name": sys.argv[2], "extra_vllm_args": sys.argv[3],
-           "extra_env": sys.argv[4]}, open(sys.argv[1], "w"), indent=2)
+           "extra_env": sys.argv[4], "rep": int(sys.argv[5])}, open(sys.argv[1], "w"), indent=2)
 PY
 
   # run the full e2e (cold restart -> load -> 07 -> GPQA -> ERS); save all output.
@@ -113,7 +135,7 @@ PY
   rc=${PIPESTATUS[0]}
   set -e
   if [[ $rc -ne 0 ]]; then
-    echo "!! EXP '$name' failed (rc=$rc) — see $EXPDIR/console.log; continuing."
+    echo "!! EXP '$name' rep $rep failed (rc=$rc) — see $EXPDIR/console.log; continuing."
     echo "$rc" > "$EXPDIR/FAILED"
     continue
   fi
@@ -133,20 +155,23 @@ PY
     echo "!! could not locate this exp's run dir (no profile_export.jsonl found)"
   fi
 done
+done
 
 # ── aggregate ────────────────────────────────────────────────────────────────
+# Reads BOTH layouts: flat <name>/exp_meta.json (REPEATS=1) and nested
+# <name>/rep<N>/exp_meta.json (REPEATS>1) — finds every exp_meta.json under OUT.
 printf '\n\033[1m========== MULTI-BENCH SUMMARY ==========\033[0m\n'
 python3 - "$OUT" <<'PY'
-import csv, glob, json, os, sys
+import csv, glob, json, math, os, sys
 
 out = sys.argv[1]
 rows = []
-for meta_path in sorted(glob.glob(os.path.join(out, "*", "exp_meta.json"))):
+for meta_path in sorted(glob.glob(os.path.join(out, "**", "exp_meta.json"), recursive=True)):
     exp = os.path.dirname(meta_path)
     meta = json.load(open(meta_path))
     r = {"name": meta["name"], "flags": meta["extra_vllm_args"] or "-",
-         "status": "ok", "acc": None, "unparsed": None, "ers": None,
-         "s_ttft": None, "s_tpot": None, "f": None, "score": None}
+         "rep": meta.get("rep", 1), "status": "ok", "acc": None, "unparsed": None,
+         "ers": None, "s_ttft": None, "s_tpot": None, "f": None, "score": None}
     if os.path.exists(os.path.join(exp, "FAILED")):
         r["status"] = "FAILED"
     sc_p = os.path.join(exp, "run", "score_summary.json")
@@ -165,26 +190,78 @@ for meta_path in sorted(glob.glob(os.path.join(out, "*", "exp_meta.json"))):
 if not rows:
     print("(no experiments found)"); sys.exit(0)
 
-def f(x, d=3):
+def fmt(x, d=3):
     return "-" if x is None else f"{x:.{d}f}"
 
-hdr = ["exp", "acc", "unpars", "ERS", "s_ttft", "s_tpot", "f(Δ)", "SCORE", "flags"]
-w = [12, 6, 6, 7, 7, 7, 6, 7, 30]
-line = "  ".join(h.ljust(wi) for h, wi in zip(hdr, w))
-print(line); print("-" * len(line))
-# best score first for readability, failures last
-for r in sorted(rows, key=lambda r: (r["score"] is None, -(r["score"] or 0))):
-    cells = [r["name"], f(r["acc"]), ("-" if r["unparsed"] is None else str(r["unparsed"])),
-             f(r["ers"], 4), f(r["s_ttft"]), f(r["s_tpot"]), f(r["f"]),
-             f(r["score"], 2), (r["flags"] if r["status"] == "ok" else f"[{r['status']}] {r['flags']}")]
-    print("  ".join(str(c).ljust(wi) for c, wi in zip(cells, w)))
+def mean(xs):
+    return sum(xs) / len(xs) if xs else None
 
+def stdev(xs):
+    if len(xs) < 2:
+        return None
+    m = mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+# raw per-rep CSV — nothing lost, every individual run is in here
 csv_path = os.path.join(out, "summary.csv")
 with open(csv_path, "w", newline="") as fh:
     wcsv = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
     wcsv.writeheader()
     for r in rows:
         wcsv.writerow(r)
-print(f"\nwrote {csv_path}")
-print(f"per-exp: {out}/<name>/{{console.log, run/per_request_report.csv, run/score_summary.json}}")
+
+# group by config name -> aggregate across reps
+by_name = {}
+for r in rows:
+    by_name.setdefault(r["name"], []).append(r)
+
+agg = []
+for name, reps in by_name.items():
+    ok = [r for r in reps if r["status"] == "ok"]
+    n_fail = len(reps) - len(ok)
+    entry = {"name": name, "flags": reps[0]["flags"], "n": len(reps), "n_fail": n_fail}
+    for key in ("acc", "ers", "s_ttft", "s_tpot", "score"):
+        vals = [r[key] for r in ok if r[key] is not None]
+        entry[key + "_mean"] = mean(vals)
+        entry[key + "_std"] = stdev(vals)
+    agg.append(entry)
+
+multi_rep = any(a["n"] > 1 for a in agg)
+hdr = ["exp", "n", "acc", "ERS", "s_ttft", "s_tpot", "SCORE", "flags"]
+w = [16, 3, 16, 16, 9, 9, 16, 28]
+line = "  ".join(h.ljust(wi) for h, wi in zip(hdr, w))
+print(line); print("-" * len(line))
+
+def cell(entry, key, d=3):
+    m, s = entry[key + "_mean"], entry[key + "_std"]
+    if m is None:
+        return "-"
+    if s is None:
+        return f"{m:.{d}f}" + ("" if entry["n"] == 1 else " (n/a)")
+    return f"{m:.{d}f}±{s:.{d}f}"
+
+for a in sorted(agg, key=lambda a: (a["score_mean"] is None, -(a["score_mean"] or 0))):
+    name_disp = a["name"] + (f" [{a['n_fail']} FAILED]" if a["n_fail"] else "")
+    cells = [name_disp, str(a["n"]), cell(a, "acc"), cell(a, "ers", 4),
+             cell(a, "s_ttft"), cell(a, "s_tpot"), cell(a, "score", 2), a["flags"]]
+    print("  ".join(str(c).ljust(wi) for c, wi in zip(cells, w)))
+
+if multi_rep:
+    print("\n(mean±stddev across reps; if two configs' ranges overlap, the difference")
+    print(" is within noise — not a real effect. 'n/a' = only 1 successful rep, no")
+    print(" variance estimate; re-run with more REPEATS before trusting that row.)")
+else:
+    print("\n(single rep per config — this is a noisy point estimate, not a fair A/B.")
+    print(" Re-run with REPEATS=3+ before concluding one config beats another.)")
+
+agg_csv = os.path.join(out, "summary_agg.csv")
+with open(agg_csv, "w", newline="") as fh:
+    wcsv = csv.DictWriter(fh, fieldnames=list(agg[0].keys()))
+    wcsv.writeheader()
+    for a in agg:
+        wcsv.writerow(a)
+
+print(f"\nwrote {csv_path} (raw, one row per rep)")
+print(f"wrote {agg_csv} (aggregated mean±std per config)")
+print(f"per-exp: {out}/<name>/{'rep<N>/' if multi_rep else ''}{{console.log, run/per_request_report.csv, run/score_summary.json}}")
 PY
