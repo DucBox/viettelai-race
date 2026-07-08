@@ -161,24 +161,53 @@ histogram `vllm:request_*`).
 
 ---
 
-## 6. Đọc trọn vẹn MỘT dòng report
+## 6. Đọc trọn vẹn report — giải thích TỪNG cột
+
+Header đầy đủ (khi run có usage cache + server metrics):
 
 ```
-user turn      arr    start      end  queue    TTFT   TPOT in_tok   out      lat    KV%  run
-   0    0      0.0      3.6   6594.2    3.6  1253.5   26.8   12900   200   6590.5  25.4%   32
+user turn      arr    start      end  queue    TTFT   TPOT in_tok   out      lat cache_rd hit%    KV%  run   Δhits    Δqry
+   0    0      0.0      3.4   9038.4    3.4  2498.0   32.8  12947   200   9035.1        -    -  30.2%   40 1398080 2357238   ← turn 0: cold, chưa cache
+   0    3  14999.2  15001.5  18978.8    2.4   269.8   18.6  21599   200   3977.3        -    -  35.7%   20 2971872 4209224   ← turn 3: input TO HƠN mà TTFT nhỏ hơn 9× (cache ăn)
 ```
 
-Dịch ra tiếng người:
+### Giải thích từng cột (kèm level)
 
-> "Request của **user 0, turn 0** đến lúc **t=0ms**, lên wire sau **3.6ms**.
-> Prompt **~12.900 token** (turn đầu, chưa có gì trong cache). Vì 20 user ập vào
-> cùng lúc nên phải xếp hàng + prefill đầy → mất **1.25 giây** tới token đầu
-> (`TTFT`). Sau đó sinh 200 token, mỗi token ~**27ms** (`TPOT`), xong lúc
-> **t=6594ms**, tổng **6.59 giây**. Lúc nó xong, engine dùng **25%** KV pool và có
-> **32** request chạy song song."
+| Cột | Ví dụ (u0 t0) | Nghĩa | Level |
+|---|---|---|---|
+| `user` | 0 | User 0..19, **= session_num % 20** | 🟡 script 07 phái sinh |
+| `turn` | 0 | Lượt 0..5, **= session_num // 20** | 🟡 phái sinh |
+| `arr` | 0.0 | **Arrival** — lúc AIPerf phát request theo lịch trace (`credit_issued_ns`), ms từ t0. ≈ `timestamp_ms` gốc | ① per-request |
+| `start` | 3.4 | Lúc request **lên wire** (`request_start_ns`) | ① per-request |
+| `end` | 9038.4 | Lúc **response stream xong** (`request_end_ns`) | ① per-request |
+| `queue` | 3.4 | `start − arr` = trễ dispatch **phía client** (~vài ms). *Chờ vì burst nằm trong TTFT, không phải ở đây* | 🟡 phái sinh |
+| `TTFT` | 2498.0 | **Time to first token** (ms) = chờ server + prefill. Prefix cache tác động thẳng vào đây | ① per-request |
+| `TPOT` | 32.8 | **Inter-token latency** trung bình (ms/token) khi decode | ① per-request |
+| `in_tok` | 12947 | **Prompt tokens** (`usage_prompt_tokens` / ISL) | ① per-request |
+| `out` | 200 | **Output tokens** sinh ra | ① per-request |
+| `lat` | 9035.1 | **Request latency** = `end − start` (ms) | ① per-request |
+| `cache_rd` | – | **Token prompt HIT prefix-cache** (`cached_tokens`). `–` khi server chưa trả — cần serve `--enable-prompt-tokens-details` | ① per-request |
+| `hit%` | – | `cache_rd / in_tok` = **% prompt tái dùng từ cache** của request đó | 🟡 phái sinh |
+| `KV%` | 30.2% | `vllm:kv_cache_usage_perc` tại scrape gần lúc `end`. **GLOBAL**, không riêng request | ③ server global |
+| `run` | 40 | `vllm:num_requests_running` — số request chạy song song lúc đó. **GLOBAL** | ③ server global |
+| `Δhits` | 1398080 | `vllm:prefix_cache_hits` **tích luỹ từ đầu run** (đơn vị token). **GLOBAL** | ③ server global |
+| `Δqry` | 2357238 | `vllm:prefix_cache_queries` tích luỹ (token). **GLOBAL**. Hit rate tổng = `Δhits/Δqry` | ③ server global |
 
-So sánh với turn 1 cùng user (`TTFT=262ms`): lịch sử đã cache → prefill ít hơn
-nhiều → nhanh gấp ~5 lần. Đó là giá trị của prefix caching, nhìn thẳng trên bảng.
+### Đọc 2 dòng ví dụ ra "tiếng người"
+
+> **u0 t0 (cold):** request đến lúc t=0, lên wire sau 3.4ms. Prompt **12.947 token**
+> (turn đầu — chưa có gì trong cache). 20 user ập vào cùng lúc (`run=40` do cả turn
+> trước còn chạy) → xếp hàng + prefill đầy → **TTFT 2498ms**. Sinh 200 token, mỗi
+> token ~33ms, xong lúc t=9038ms, tổng **9.0 giây**.
+>
+> **u0 t3 (cached):** prompt giờ **21.599 token — TO HƠN** (lịch sử dồn thêm), nhưng
+> **TTFT chỉ 270ms — nhỏ hơn 9 lần!** Vì phần lịch sử chung đã nằm trong KV cache →
+> chỉ prefill ~2.9k token mới. **Đây chính là prefix caching, nhìn thẳng trên bảng:
+> input phình mà TTFT tụt.**
+
+> **Đọc cache toàn cục ngay cả khi cột `hit%` trống:** lấy `Δhits/Δqry` dòng cuối
+> cùng của run → ví dụ `5.236.544 / 6.799.373 ≈ 77%` = tỉ lệ token prompt tái dùng
+> cache cho cả run.
 
 ---
 
