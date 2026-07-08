@@ -12,6 +12,17 @@
 #                                                   # the faithful benchmark — no synthetic content.
 #                                                   # Run bench/convert_trace_to_aiperf.py first.
 #
+# GPU telemetry: AIPerf's DEFAULT GPU-telemetry source is a DCGM exporter HTTP
+# endpoint (localhost:9400/9401) — that's almost never running on a plain dev
+# box, so every run prints "GPU Telemetry: ... not reachable" and collects
+# nothing. We pass --gpu-telemetry pynvml instead: reads GPU stats (util%,
+# memory, power, temp) directly via NVIDIA's nvidia-ml-py bindings (same lib
+# nvidia-smi uses) — no DCGM container/setup needed, already a dependency of
+# aiperf itself. Populates gpu_telemetry_export.jsonl in the run dir (present
+# but empty without this). Override e.g. GPU_TELEMETRY="pynvml dashboard" for
+# the realtime dashboard, or GPU_TELEMETRY="localhost:9400" if you do have a
+# DCGM exporter running.
+#
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -84,6 +95,7 @@ if [[ "$MODE" == "replay" ]]; then
     --fixed-schedule \
     --use-server-token-count \
     --server-metrics-formats json csv jsonl \
+    --gpu-telemetry ${GPU_TELEMETRY:-pynvml} \
     --random-seed 42
 
   echo
@@ -132,7 +144,8 @@ aiperf profile \
   --output-tokens-stddev 0 \
   --extra-inputs "max_tokens:$OSL" \
   --extra-inputs "temperature:0" \
-  --extra-inputs "ignore_eos:true"
+  --extra-inputs "ignore_eos:true" \
+  --gpu-telemetry ${GPU_TELEMETRY:-pynvml}
 
 echo
 echo ">> Client report + server_metrics_export.* saved under ./artifacts/ (AIPerf default)."
