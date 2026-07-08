@@ -9,7 +9,13 @@
 # watch KV cache usage and prefix cache hit rate move under load.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Preserve caller-provided env vars across the .env source (consistent with
+# serve_up.sh / 10_bench_e2e.sh / run_aiperf_baseline.sh / 01_check_model.sh) —
+# e.g. `URL=http://host:8001 ./scripts/03_watch_metrics.sh` should watch that
+# URL, not silently fall back to serve/.env's own default.
+_pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
+eval "$_pre_env_declare"
 
 URL="${URL:-http://localhost:8000}"
 INTERVAL="${INTERVAL:-2}"

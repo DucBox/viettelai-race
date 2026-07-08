@@ -10,7 +10,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Preserve caller-provided env vars across the .env source (consistent with
+# serve_up.sh / 10_bench_e2e.sh / run_aiperf_baseline.sh / 01_check_model.sh) —
+# e.g. `MODEL_DIR=... ./scripts/06_module_tree_docker.sh` should inspect that
+# directory, not silently fall back to serve/.env's own default.
+_pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
+eval "$_pre_env_declare"
 MODEL_DIR="${MODEL_DIR:-serve/models/qwen3.5-2b}"
 case "$MODEL_DIR" in
   /*|serve/*) : ;;
