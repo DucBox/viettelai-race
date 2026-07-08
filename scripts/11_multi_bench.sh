@@ -69,6 +69,7 @@ if [[ -n "$_env_extra_vllm_args" ]]; then
   echo "   Fix: clear it in serve/.env (EXTRA_VLLM_ARGS=) and re-run." >&2
   exit 1
 fi
+echo ">> serve/.env EXTRA_VLLM_ARGS check: empty/absent — OK, per-row flags will apply"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="artifacts/multibench/$TS"
