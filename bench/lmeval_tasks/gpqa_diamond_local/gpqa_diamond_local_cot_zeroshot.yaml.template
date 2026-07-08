@@ -1,0 +1,62 @@
+# Custom lm-eval task: GPQA-Diamond CoT zero-shot, sourced from OUR local
+# flattened parquet (data/GPQA/gpqa_diamond.parquet — question+answer, choices
+# already baked into the question text) instead of the official
+# Idavidrein/gpqa dataset (gated on HF Hub, needs raw Question/Correct
+# Answer/Incorrect Answer N columns we don't have).
+#
+# Prompt/answer-extraction/generation_kwargs/metric below are copied VERBATIM
+# from lm-evaluation-harness's own
+# lm_eval/tasks/gpqa/cot_zeroshot/_gpqa_cot_zeroshot_yaml (fetched from
+# EleutherAI/lm-evaluation-harness on GitHub, main branch) — same standardized
+# scoring pipeline, just pointed at local data. doc_to_text is adapted since
+# our data has the 4 choices already embedded in `question` (no separate
+# choice1..4 fields to template in).
+#
+# KNOWN LIMITATION vs the official task: the official task's process_docs()
+# randomly reshuffles which answer choice is A/B/C/D on every run (defeats
+# position bias). Our source data has a FIXED lettering already baked into the
+# question text, so this variant does NOT get that bias correction — same
+# limitation scripts/09_gpqa_accuracy.py already has. Good enough to validate
+# the standardized prompt+scoring pipeline works; revisit if letter-position
+# bias turns out to matter for your numbers.
+#
+# __GPQA_PARQUET_PATH__ is a placeholder — scripts/12_gpqa_lmeval.sh
+# substitutes it with the real absolute path at run time and writes the
+# result to the sibling (gitignored) .yaml file next to this .template.
+task: gpqa_diamond_local_cot_zeroshot
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    test: __GPQA_PARQUET_PATH__
+test_split: test
+output_type: generate_until
+doc_to_text: "{{question}}\nLet's think step by step: "
+doc_to_target: "({{answer}})"
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: "(?<=The answer is )(.*)(?=.)"
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "multi_choice_regex"
+        group_select: -1
+        ignore_case: true
+        ignore_punctuation: true
+        regex_pattern: "(\\([A-Z]\\))"
+      - function: "take_first"
+generation_kwargs:
+  until:
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+num_fewshot: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+metadata:
+  version: 1.0
