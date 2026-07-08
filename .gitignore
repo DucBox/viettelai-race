@@ -18,6 +18,7 @@ bench/.venv/
 # AIPerf outputs
 artifacts/
 **/artifacts/
+bench/bench_results/
 
 # Original competition trace (provided by organizers) — not tracked in git.
 # Only the converted AIPerf replay input (data/*.aiperf.jsonl) is committed,
