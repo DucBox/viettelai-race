@@ -104,6 +104,8 @@ if [[ "$MODE" == "native" ]]; then
       > "$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
   LOGS_CMD="tail -f $LOGFILE"
+  is_alive() { kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+  tail_log() { tail -n 40 "$LOGFILE" 2>/dev/null; }
 else
   USE_COMPOSE=""
   if docker compose version >/dev/null 2>&1; then
@@ -116,6 +118,8 @@ else
     echo ">> Starting vLLM via '${COMPOSE[*]}' (GPU_ID=$GPU_ID) ..."
     ( cd serve && "${COMPOSE[@]}" up -d vllm )
     LOGS_CMD="cd serve && ${COMPOSE[*]} logs -f vllm"
+    is_alive() { [[ -n "$(cd serve && "${COMPOSE[@]}" ps -q vllm 2>/dev/null)" ]]; }
+    tail_log() { ( cd serve && "${COMPOSE[@]}" logs --tail 40 vllm ) 2>/dev/null; }
   else
     echo ">> No compose CLI found (v2 plugin or v1 binary) — using plain 'docker run' instead."
     docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
@@ -153,6 +157,8 @@ else
       fi
     fi
     LOGS_CMD="docker logs -f vllm-qwen35"
+    is_alive() { [[ -n "$(docker ps -q --filter name=vllm-qwen35 2>/dev/null)" ]]; }
+    tail_log() { docker logs --tail 40 vllm-qwen35 2>&1; }
   fi
 fi
 
@@ -168,9 +174,24 @@ for i in $(seq 1 120); do
     echo "     source bench/.venv/bin/activate && ./bench/run_aiperf_baseline.sh   # collect + display via AIPerf"
     exit 0
   fi
+  # Fail fast instead of silently burning the full 10-minute budget: if the
+  # process/container has already died (bad flag, OOM, port conflict, ...), the
+  # health check will never succeed no matter how long we wait. Catching this
+  # early also surfaces the real error — it otherwise only lives in
+  # serve/vllm.log (native) or `docker logs`, neither of which is captured by
+  # 10_bench_e2e.sh / 11_multi_bench.sh's console.log.
+  if ! is_alive; then
+    echo
+    echo "!! vLLM process/container exited during startup (after ~$((i*5))s) — this is a"
+    echo "   crash, not a slow load. Last 40 log lines:"
+    echo "   ------------------------------------------------------------------"
+    tail_log
+    echo "   ------------------------------------------------------------------"
+    exit 1
+  fi
   sleep 5
 done
 
-echo "!! Not healthy after 10 minutes. Check logs:"
+echo "!! Not healthy after 10 minutes (process is alive but never became ready). Check logs:"
 echo "     $LOGS_CMD"
 exit 1
