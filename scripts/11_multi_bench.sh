@@ -46,9 +46,28 @@ EXPERIMENTS=(
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODE="${MODE:-replay}"
-if [[ -f serve/.env ]] && grep -q '^[[:space:]]*EXTRA_VLLM_ARGS=' serve/.env; then
-  echo "!! WARNING: serve/.env sets EXTRA_VLLM_ARGS — it will OVERRIDE the per-row"
-  echo "   flags below (serve_up.sh sources .env last). Remove it from serve/.env."
+
+# Hard-check serve/.env's ACTUAL EXTRA_VLLM_ARGS value (not just line presence —
+# .env.example ships an empty `EXTRA_VLLM_ARGS=` placeholder, which must NOT
+# trigger this). Sourced in an isolated subshell so it can't be polluted by (or
+# pollute) this script's own env. serve_up.sh sources .env AFTER inheriting each
+# row's EXTRA_VLLM_ARGS, and a plain assignment always wins — so a non-empty
+# value here silently makes every row in the sweep serve the SAME config.
+_env_extra_vllm_args="$(
+  unset EXTRA_VLLM_ARGS
+  [[ -f serve/.env ]] && { set -a; source serve/.env >/dev/null 2>&1; set +a; }
+  printf '%s' "${EXTRA_VLLM_ARGS:-}"
+)"
+# trim surrounding whitespace so "  " also counts as empty
+read -r _env_extra_vllm_args <<<"$_env_extra_vllm_args"
+if [[ -n "$_env_extra_vllm_args" ]]; then
+  echo "!! serve/.env sets EXTRA_VLLM_ARGS=\"$_env_extra_vllm_args\"" >&2
+  echo "   This OVERRIDES every row's flags below (serve_up.sh sources .env AFTER" >&2
+  echo "   inheriting each row's EXTRA_VLLM_ARGS; a plain assignment always wins," >&2
+  echo "   it never merges). Every experiment would silently serve the SAME" >&2
+  echo "   config — the sweep would be meaningless." >&2
+  echo "   Fix: clear it in serve/.env (EXTRA_VLLM_ARGS=) and re-run." >&2
+  exit 1
 fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
