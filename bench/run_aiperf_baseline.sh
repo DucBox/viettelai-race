@@ -14,7 +14,22 @@
 #
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Preserve EVERY caller-provided env var (e.g. 11_multi_bench.sh's per-row
+# `env SERVED_MODEL_NAME=... MODEL_DIR=... ...`, or 10_bench_e2e.sh forwarding
+# them) across the .env source below. serve/.env ships REAL non-empty defaults
+# for SERVED_MODEL_NAME, MODEL_DIR, GPU_MEM_UTIL, etc. — sourcing it is a plain
+# assignment that unconditionally overwrites ANY of these the caller set. This
+# is the same class of bug fixed in serve_up.sh / 10_bench_e2e.sh (see
+# 6337c30 / c7cbca5): without this, the SERVER can be running one row's config
+# (e.g. a different MODEL_DIR or SERVED_MODEL_NAME) while AIPerf silently
+# benchmarks against serve/.env's own (different) default instead — wrong
+# tokenizer, wrong --model, or both, with no error. Snapshotting every exported
+# var beforehand and re-declaring them after restores exactly what the caller
+# passed in, while untouched vars still pick up .env's value normally.
+_pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
+eval "$_pre_env_declare"
 
 URL="${URL:-http://localhost:8000}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.5-2b}"
