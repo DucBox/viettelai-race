@@ -106,6 +106,7 @@ if [[ "$MODE" == "native" ]]; then
   LOGS_CMD="tail -f $LOGFILE"
   is_alive() { kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
   tail_log() { tail -n 40 "$LOGFILE" 2>/dev/null; }
+  full_log() { cat "$LOGFILE" 2>/dev/null; }
 else
   USE_COMPOSE=""
   if docker compose version >/dev/null 2>&1; then
@@ -120,6 +121,7 @@ else
     LOGS_CMD="cd serve && ${COMPOSE[*]} logs -f vllm"
     is_alive() { [[ -n "$(cd serve && "${COMPOSE[@]}" ps -q vllm 2>/dev/null)" ]]; }
     tail_log() { ( cd serve && "${COMPOSE[@]}" logs --tail 40 vllm ) 2>/dev/null; }
+    full_log() { ( cd serve && "${COMPOSE[@]}" logs --no-log-prefix vllm ) 2>/dev/null; }
   else
     echo ">> No compose CLI found (v2 plugin or v1 binary) — using plain 'docker run' instead."
     docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
@@ -159,6 +161,7 @@ else
     LOGS_CMD="docker logs -f vllm-qwen35"
     is_alive() { [[ -n "$(docker ps -q --filter name=vllm-qwen35 2>/dev/null)" ]]; }
     tail_log() { docker logs --tail 40 vllm-qwen35 2>&1; }
+    full_log() { docker logs vllm-qwen35 2>&1; }
   fi
 fi
 
@@ -167,6 +170,20 @@ URL="http://localhost:8000"
 for i in $(seq 1 120); do
   if curl -fsS "$URL/health" >/dev/null 2>&1; then
     echo ">> vLLM is UP after ~$((i*5))s. $URL"
+    echo
+    # Surface vLLM's own memory-profiling log lines — how much VRAM the weights
+    # took vs how many KV-cache blocks/tokens that left room for. This is the
+    # ground truth for "did quantization actually shrink the weights, and how
+    # much extra KV headroom did that buy" — otherwise it only ever lived in
+    # serve/vllm.log (native) or `docker logs`, invisible to the bench pipeline.
+    echo ">> Server memory profile (weights / KV cache, from vLLM's own startup log):"
+    MEM_LINES="$(full_log | grep -iE 'weights took|gpu blocks|kv cache|maximum concurrency|quantiz' || true)"
+    if [[ -n "$MEM_LINES" ]]; then
+      echo "$MEM_LINES" | sed 's/^/     /'
+    else
+      echo "     (no matching log lines found — check $LOGS_CMD manually; vLLM's exact"
+      echo "      wording may differ on this version)"
+    fi
     echo
     echo ">> Next steps:"
     echo "     ./scripts/02_smoke_test.sh          # confirm inference actually works"
