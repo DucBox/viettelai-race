@@ -97,8 +97,16 @@ total=$(( ${#EXPERIMENTS[@]} * REPEATS ))
 # bias one config vs another the way a blocked order (row1×N, row2×N, ...) would.
 for rep in $(seq 1 "$REPEATS"); do
 for row in "${EXPERIMENTS[@]}"; do
-  # split on tab into name / args / extra-env
-  IFS=$'\t' read -r name args extra <<<"$row"
+  # split on tab into name / args / extra-env. NOT `IFS=$'\t' read` — bash
+  # classifies tab as "IFS whitespace" and COALESCES consecutive delimiters
+  # (like it does for spaces), silently dropping an empty middle field: a row
+  # with EXTRA_VLLM_ARGS empty and extra-env set (e.g. `name\t\tGPU_MEM_UTIL=0.9`)
+  # would shift the extra-env value into args instead, which then gets appended
+  # to `vllm serve` as a bogus token -> "unrecognized arguments: GPU_MEM_UTIL=0.9".
+  # awk with a single-char FS does an exact split, no coalescing.
+  name="$(awk -F'\t' '{print $1}' <<<"$row")"
+  args="$(awk -F'\t' '{print $2}' <<<"$row")"
+  extra="$(awk -F'\t' '{print $3}' <<<"$row")"
   name="${name## }"; name="${name%% }"
   [[ -z "$name" || "$name" == \#* ]] && continue
   n=$((n + 1))
