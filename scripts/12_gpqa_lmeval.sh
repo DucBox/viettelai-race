@@ -48,7 +48,10 @@
 #   NUM_CONCURRENT           parallel in-flight requests (default 32)
 #   MAX_RETRIES              per-request retry budget (default 3)
 #   MAX_GEN_TOKS             generation budget — CoT needs room to think before
-#                            answering, same lesson as scripts/09 (default 2048)
+#                            answering, same lesson as scripts/09 (default 16384)
+#   SYSTEM_INSTRUCTION       forces the model to sign off in the exact phrase our
+#                            regex looks for (see comment below for why this is
+#                            NOT optional in practice). Set empty to disable.
 #   OUT                      output dir (default artifacts/gpqa_lmeval/<ts>)
 #   LMEVAL_EXTRA_ARGS        extra args appended verbatim to `lm_eval`
 set -euo pipefail
@@ -66,7 +69,18 @@ TASK="${TASK:-gpqa_diamond_local_cot_zeroshot}"
 GPQA_PARQUET="${GPQA_PARQUET:-data/GPQA/gpqa_diamond.parquet}"
 NUM_CONCURRENT="${NUM_CONCURRENT:-32}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
-MAX_GEN_TOKS="${MAX_GEN_TOKS:-2048}"
+MAX_GEN_TOKS="${MAX_GEN_TOKS:-16384}"
+# Empirically necessary: with NO system instruction, this model concludes CoT
+# in its own natural style ("The correct option is **B**." / "**Answer:**
+# C.") — markdown-bold, no parens, never the literal phrase "The answer is".
+# Neither filter (strict-match: "The answer is X"; flexible-extract: "(X)")
+# ever matches that -> near-zero measured accuracy that has NOTHING to do
+# with the model's real capability (verified: full-length, non-truncated
+# completions, correct reasoning, just the wrong sign-off phrasing). Pass
+# --system_instruction (confirmed real flag: lm_eval/_cli/run.py) to force
+# the model onto the exact phrase our regex looks for. Set SYSTEM_INSTRUCTION=
+# (empty) to disable and reproduce the raw/uninstructed failure mode.
+SYSTEM_INSTRUCTION="${SYSTEM_INSTRUCTION:-You are an expert scientist. Reason through the problem step by step, then end your response with exactly this sentence on its own line: The answer is (X) — replacing X with the correct letter.}"
 OUT="${OUT:-artifacts/gpqa_lmeval/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT"
 
@@ -97,7 +111,11 @@ elif ! command -v lm_eval >/dev/null 2>&1; then
   exit 1
 fi
 
+SYS_ARGS=()
+[[ -n "$SYSTEM_INSTRUCTION" ]] && SYS_ARGS=(--system_instruction "$SYSTEM_INSTRUCTION")
+
 echo ">> lm-eval GPQA  task=$TASK  server=$URL  model=$MODEL"
+echo ">> system_instruction: ${SYSTEM_INSTRUCTION:-<none>}"
 echo ">> out: $OUT"
 
 # HF_HUB_OFFLINE=1 is harmless (and correct) even for the local task — it
@@ -109,6 +127,7 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   --model_args "model=${MODEL},base_url=${URL}/v1/chat/completions,num_concurrent=${NUM_CONCURRENT},max_retries=${MAX_RETRIES},tokenized_requests=False" \
   --tasks "$TASK" \
   "${INCLUDE_ARGS[@]}" \
+  "${SYS_ARGS[@]}" \
   --gen_kwargs "temperature=0,max_gen_toks=${MAX_GEN_TOKS}" \
   --output_path "$OUT" \
   --log_samples \

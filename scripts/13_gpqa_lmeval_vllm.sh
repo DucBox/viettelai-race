@@ -63,7 +63,11 @@ VLLM_MODEL_ARGS="${VLLM_MODEL_ARGS:-pretrained=__MODEL_DIR_ABS__,dtype=auto,gpu_
 #   MAX_GEN_TOKS      generation budget — only applies if TASK is a
 #                     generate_until task (e.g. the _cot_zeroshot variant);
 #                     ignored for multiple_choice tasks, nothing to generate
-#                     (default 2048)
+#                     (default 16384)
+#   SYSTEM_INSTRUCTION  forces the model to sign off in the exact phrase our
+#                     regex looks for (generate_until tasks only — see comment
+#                     below for why this is NOT optional in practice). Empty
+#                     to disable.
 #   APPLY_CHAT_TEMPLATE  1 (default) formats the prompt through the model's
 #                     chat template, matching what /v1/chat/completions does
 #                     in script 12 (fair comparison). Set 0 to test raw
@@ -92,8 +96,18 @@ GPU_ID="${GPU_ID:-0}"
 TASK="${TASK:-gpqa_diamond_local_zeroshot}"
 GPQA_PARQUET="${GPQA_PARQUET:-data/GPQA/gpqa_diamond.parquet}"
 BATCH_SIZE="${BATCH_SIZE:-auto}"
-MAX_GEN_TOKS="${MAX_GEN_TOKS:-2048}"
+MAX_GEN_TOKS="${MAX_GEN_TOKS:-16384}"
 APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-1}"
+# Empirically necessary for the CoT (generate_until) task: with NO system
+# instruction, this model concludes in its own natural style ("The correct
+# option is **B**." / "**Answer:** C.") — markdown-bold, no parens, never the
+# literal phrase "The answer is". Neither filter ever matches that -> near-
+# zero measured accuracy unrelated to the model's real capability (verified:
+# full-length, non-truncated, correctly-reasoned completions, just the wrong
+# sign-off phrasing). Only applied for generate_until tasks (see OUTPUT_TYPE
+# check below) — meaningless for multiple_choice/log-likelihood. Set
+# SYSTEM_INSTRUCTION= (empty) to disable and reproduce the raw failure mode.
+SYSTEM_INSTRUCTION="${SYSTEM_INSTRUCTION:-You are an expert scientist. Reason through the problem step by step, then end your response with exactly this sentence on its own line: The answer is (X) — replacing X with the correct letter.}"
 OUT="${OUT:-artifacts/gpqa_lmeval_vllm/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT"
 
@@ -135,11 +149,14 @@ else
 fi
 
 # multiple_choice (log-likelihood) tasks don't generate anything —
-# --gen_kwargs/max_gen_toks would be meaningless, so only pass it for
-# generate_until tasks (the CoT variant, if TASK= override points there).
+# --gen_kwargs/max_gen_toks/system_instruction would be meaningless there, so
+# only pass them for generate_until tasks (the CoT variant, if TASK= override
+# points there).
 GEN_ARGS=()
+SYS_ARGS=()
 if [[ "$OUTPUT_TYPE" != "multiple_choice" ]]; then
   GEN_ARGS=(--gen_kwargs "temperature=0,max_gen_toks=${MAX_GEN_TOKS}")
+  [[ -n "$SYSTEM_INSTRUCTION" ]] && SYS_ARGS=(--system_instruction "$SYSTEM_INSTRUCTION")
 fi
 
 if [[ -f bench/.venv-lmeval/bin/activate ]]; then
@@ -158,6 +175,11 @@ echo ">> lm-eval GPQA  task=$TASK (output_type=${OUTPUT_TYPE:-unknown})  backend
 echo ">> GPU_ID=$GPU_ID (CUDA_VISIBLE_DEVICES)"
 echo ">> model_args: $VLLM_MODEL_ARGS"
 echo ">> apply_chat_template=$APPLY_CHAT_TEMPLATE"
+if [[ ${#SYS_ARGS[@]} -gt 0 ]]; then
+  echo ">> system_instruction: $SYSTEM_INSTRUCTION"
+else
+  echo ">> system_instruction: <none>"
+fi
 echo ">> out: $OUT"
 
 CUDA_VISIBLE_DEVICES="$GPU_ID" \
@@ -168,6 +190,7 @@ CUDA_VISIBLE_DEVICES="$GPU_ID" \
   --tasks "$TASK" \
   "${INCLUDE_ARGS[@]}" \
   "${GEN_ARGS[@]}" \
+  "${SYS_ARGS[@]}" \
   --batch_size "$BATCH_SIZE" \
   "${CHAT_ARGS[@]}" \
   --output_path "$OUT" \
