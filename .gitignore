@@ -16,10 +16,12 @@ serve/models/*/
 bench/.venv/
 bench/.venv-lmeval/
 
-# Generated from gpqa_diamond_local_cot_zeroshot.yaml.template (has an
-# absolute, machine-specific path baked in) — regenerated every run by
-# scripts/12_gpqa_lmeval.sh. Only the .template is source.
-bench/lmeval_tasks/gpqa_diamond_local/gpqa_diamond_local_cot_zeroshot.yaml
+# Generated from the .yaml.template files in this dir (each has an absolute,
+# machine-specific path baked in) — regenerated every run by scripts/12 and
+# scripts/13. Only the .template files are source; this covers any task name,
+# present or future, without needing a new entry per task.
+bench/lmeval_tasks/gpqa_diamond_local/*.yaml
+!bench/lmeval_tasks/gpqa_diamond_local/*.yaml.template
 
 # AIPerf outputs
 artifacts/
