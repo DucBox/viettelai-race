@@ -97,11 +97,20 @@ def load_model(model_dir):
     import torch
     import transformers
 
+    # NOT device_map="auto": at 2.27B params (~4.5GB BF16) this fits on any
+    # single modern GPU with room to spare — device_map="auto" only earns its
+    # keep on models too big for one card. Forcing everything onto a single
+    # real device (index 0, or CPU if no CUDA) sidesteps accelerate's dispatch
+    # hooks entirely, which is exactly the layer implicated in a real device
+    # -side assert seen crossing an accelerate hook boundary on this very-new
+    # model (modeling_qwen3_5.py) — fewer moving parts, less surface for a
+    # multi-device dtype/placement bug to hide in.
+    device_map = {"": 0} if torch.cuda.is_available() else None
     for loader_name in ("AutoModelForImageTextToText", "AutoModelForCausalLM", "AutoModel"):
         try:
             Loader = getattr(transformers, loader_name)
-            model = Loader.from_pretrained(model_dir, dtype="auto", device_map="auto")
-            print(f">> loaded via {loader_name}")
+            model = Loader.from_pretrained(model_dir, dtype="auto", device_map=device_map)
+            print(f">> loaded via {loader_name}  (device_map={device_map})")
             return model
         except Exception as e:  # noqa: BLE001
             print(f"   {loader_name} failed: {e}")
