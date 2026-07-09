@@ -52,6 +52,10 @@ VLLM_MODEL_ARGS="${VLLM_MODEL_ARGS:-pretrained=__MODEL_DIR_ABS__,dtype=auto,gpu_
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Env (all optional):
+#   GPU_ID            which physical GPU to pin this engine to via
+#                     CUDA_VISIBLE_DEVICES (default 0 — same convention as
+#                     serve_up.sh; on a multi-GPU host, point this at an IDLE
+#                     card if serve_up.sh's server is using GPU_ID=0)
 #   TASK              lm-eval task name (default gpqa_diamond_local_zeroshot,
 #                     the log-likelihood variant)
 #   GPQA_PARQUET      local data file (default data/GPQA/gpqa_diamond.parquet)
@@ -84,6 +88,7 @@ case "$MODEL_DIR" in
 esac
 VLLM_MODEL_ARGS="${VLLM_MODEL_ARGS/__MODEL_DIR_ABS__/$MODEL_DIR_ABS}"
 
+GPU_ID="${GPU_ID:-0}"
 TASK="${TASK:-gpqa_diamond_local_zeroshot}"
 GPQA_PARQUET="${GPQA_PARQUET:-data/GPQA/gpqa_diamond.parquet}"
 BATCH_SIZE="${BATCH_SIZE:-auto}"
@@ -150,11 +155,13 @@ CHAT_ARGS=()
 [[ "$APPLY_CHAT_TEMPLATE" == "1" ]] && CHAT_ARGS+=(--apply_chat_template)
 
 echo ">> lm-eval GPQA  task=$TASK (output_type=${OUTPUT_TYPE:-unknown})  backend=vllm (separate engine, NOT the HTTP server)"
+echo ">> GPU_ID=$GPU_ID (CUDA_VISIBLE_DEVICES)"
 echo ">> model_args: $VLLM_MODEL_ARGS"
 echo ">> apply_chat_template=$APPLY_CHAT_TEMPLATE"
 echo ">> out: $OUT"
 
-HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+CUDA_VISIBLE_DEVICES="$GPU_ID" \
+  HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   lm_eval \
   --model vllm \
   --model_args "$VLLM_MODEL_ARGS" \
