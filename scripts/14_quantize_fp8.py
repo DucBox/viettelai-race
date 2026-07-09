@@ -139,7 +139,8 @@ def preflight_report(model, cfg):
     print(f"  Linear params quantized (FP8) : {quantized_params/1e9:8.3f} B  ({100*quantized_params/total:5.1f}%)")
     print(f"  Linear params ignored (BF16)  : {ignored_params/1e9:8.3f} B  ({100*ignored_params/total:5.1f}%)")
     print(f"  linear_attn Linear modules ignored: {n_linear_attn_ignored}  "
-          f"(expect 18 layers x 3 = 54: in_proj_qkv/in_proj_z/out_proj)")
+          f"(expect 18 layers x 5 = 90: in_proj_qkv/in_proj_z/in_proj_a/in_proj_b/out_proj "
+          f"— in_proj_a/_b ARE nn.Linear too, tiny [16,2048], swept in by the same blanket regex)")
     if n_linear_attn_ignored == 0:
         sys.exit("!! 0 linear_attn modules matched — module names don't look like expected "
                  "(model.language_model.layers.N.linear_attn.*). Wrong model or wrong loader class. Aborting.")
@@ -151,10 +152,18 @@ def sanity_generate(model, tokenizer, label):
 
     h(f"SANITY-CHECK GENERATION ({label})")
     msgs = [{"role": "user", "content": SANITY_PROMPT}]
-    input_ids = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to(model.device)
+    # return_dict=True is required here: this transformers version's chat
+    # template returns a BatchEncoding (dict-like: input_ids + attention_mask),
+    # NOT a bare tensor, even with return_tensors="pt" alone. Passing that dict
+    # positionally as `input_ids` to generate() crashes deep inside
+    # (inputs_tensor.shape[0] on a dict). Ask for the dict explicitly and
+    # unpack it — works whether or not this quirk is present.
+    inputs = tokenizer.apply_chat_template(
+        msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True
+    ).to(model.device)
     with torch.no_grad():
-        out = model.generate(input_ids, max_new_tokens=64, do_sample=False)
-    text = tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        out = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+    text = tokenizer.decode(out[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
     print(f"  prompt: {SANITY_PROMPT}")
     print(f"  output: {text!r}")
     if len(text.strip()) < 5:
