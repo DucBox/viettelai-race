@@ -30,10 +30,17 @@
 #   ./scripts/13_gpqa_lmeval_vllm.sh            # full run
 #   ./scripts/13_gpqa_lmeval_vllm.sh --limit 20 # quick smoke
 #
-# Data source / prompt / regex / metric: same standardized local task as
-# script 12 (gpqa_diamond_local_cot_zeroshot — see that script's header for
-# the full explanation of what it is and its known limitation vs the official
-# gated Idavidrein/gpqa task).
+# SCORING METHOD — this is the LOG-LIKELIHOOD / forced-choice variant, NOT
+# generation+regex: default task is gpqa_diamond_local_zeroshot
+# (output_type: multiple_choice — mirrors lm-eval's official
+# gpqa_diamond_zeroshot: no generation, no CoT, just compares the
+# log-probability of the literal continuations "A"/"B"/"C"/"D" and picks the
+# highest). Script 12 stays the generation+CoT+regex variant
+# (gpqa_diamond_local_cot_zeroshot) against the real HTTP server — run both as
+# a cross-check, they can legitimately disagree. Data is still our local
+# data/GPQA/gpqa_diamond.parquet (not the gated Idavidrein/gpqa Hub dataset),
+# fully offline. Set TASK=gpqa_diamond_local_cot_zeroshot to run the CoT
+# variant through this script's separate-engine backend instead.
 #
 # ── EDIT THIS — the exact vLLM engine config to test ─────────────────────────
 # Comma-separated key=value pairs, passed verbatim as `--model_args` to
@@ -45,10 +52,14 @@ VLLM_MODEL_ARGS="${VLLM_MODEL_ARGS:-pretrained=__MODEL_DIR_ABS__,dtype=auto,gpu_
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Env (all optional):
-#   TASK              lm-eval task name (default gpqa_diamond_local_cot_zeroshot)
+#   TASK              lm-eval task name (default gpqa_diamond_local_zeroshot,
+#                     the log-likelihood variant)
 #   GPQA_PARQUET      local data file (default data/GPQA/gpqa_diamond.parquet)
 #   BATCH_SIZE        vLLM offline batch size (default auto)
-#   MAX_GEN_TOKS      generation budget — CoT needs room to think (default 2048)
+#   MAX_GEN_TOKS      generation budget — only applies if TASK is a
+#                     generate_until task (e.g. the _cot_zeroshot variant);
+#                     ignored for multiple_choice tasks, nothing to generate
+#                     (default 2048)
 #   APPLY_CHAT_TEMPLATE  1 (default) formats the prompt through the model's
 #                     chat template, matching what /v1/chat/completions does
 #                     in script 12 (fair comparison). Set 0 to test raw
@@ -73,7 +84,7 @@ case "$MODEL_DIR" in
 esac
 VLLM_MODEL_ARGS="${VLLM_MODEL_ARGS/__MODEL_DIR_ABS__/$MODEL_DIR_ABS}"
 
-TASK="${TASK:-gpqa_diamond_local_cot_zeroshot}"
+TASK="${TASK:-gpqa_diamond_local_zeroshot}"
 GPQA_PARQUET="${GPQA_PARQUET:-data/GPQA/gpqa_diamond.parquet}"
 BATCH_SIZE="${BATCH_SIZE:-auto}"
 MAX_GEN_TOKS="${MAX_GEN_TOKS:-2048}"
@@ -99,19 +110,31 @@ if curl -fsS "http://localhost:8000/health" >/dev/null 2>&1; then
   fi
 fi
 
+# Generalized: match by naming convention "<task>.yaml.template" so either
+# local task (the log-likelihood _zeroshot default, or _cot_zeroshot via
+# TASK= override) renders correctly — not hardcoded to one task name.
 TASK_DIR="bench/lmeval_tasks/gpqa_diamond_local"
-if [[ "$TASK" == "gpqa_diamond_local_cot_zeroshot" ]]; then
+TEMPLATE="$TASK_DIR/$TASK.yaml.template"
+OUTPUT_TYPE=""
+if [[ -f "$TEMPLATE" ]]; then
   if [[ ! -f "$GPQA_PARQUET" ]]; then
     echo "!! GPQA_PARQUET not found: $GPQA_PARQUET" >&2
     exit 1
   fi
   GPQA_PARQUET_ABS="$(cd "$(dirname "$GPQA_PARQUET")" && pwd)/$(basename "$GPQA_PARQUET")"
-  sed "s|__GPQA_PARQUET_PATH__|$GPQA_PARQUET_ABS|" \
-    "$TASK_DIR/gpqa_diamond_local_cot_zeroshot.yaml.template" \
-    > "$TASK_DIR/gpqa_diamond_local_cot_zeroshot.yaml"
+  sed "s|__GPQA_PARQUET_PATH__|$GPQA_PARQUET_ABS|" "$TEMPLATE" > "$TASK_DIR/$TASK.yaml"
+  OUTPUT_TYPE="$(grep -m1 '^output_type:' "$TASK_DIR/$TASK.yaml" | awk '{print $2}')"
   INCLUDE_ARGS=(--include_path "$TASK_DIR")
 else
   INCLUDE_ARGS=()
+fi
+
+# multiple_choice (log-likelihood) tasks don't generate anything —
+# --gen_kwargs/max_gen_toks would be meaningless, so only pass it for
+# generate_until tasks (the CoT variant, if TASK= override points there).
+GEN_ARGS=()
+if [[ "$OUTPUT_TYPE" != "multiple_choice" ]]; then
+  GEN_ARGS=(--gen_kwargs "temperature=0,max_gen_toks=${MAX_GEN_TOKS}")
 fi
 
 if [[ -f bench/.venv-lmeval/bin/activate ]]; then
@@ -126,7 +149,7 @@ fi
 CHAT_ARGS=()
 [[ "$APPLY_CHAT_TEMPLATE" == "1" ]] && CHAT_ARGS+=(--apply_chat_template)
 
-echo ">> lm-eval GPQA  task=$TASK  backend=vllm (separate engine, NOT the HTTP server)"
+echo ">> lm-eval GPQA  task=$TASK (output_type=${OUTPUT_TYPE:-unknown})  backend=vllm (separate engine, NOT the HTTP server)"
 echo ">> model_args: $VLLM_MODEL_ARGS"
 echo ">> apply_chat_template=$APPLY_CHAT_TEMPLATE"
 echo ">> out: $OUT"
@@ -137,7 +160,7 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   --model_args "$VLLM_MODEL_ARGS" \
   --tasks "$TASK" \
   "${INCLUDE_ARGS[@]}" \
-  --gen_kwargs "temperature=0,max_gen_toks=${MAX_GEN_TOKS}" \
+  "${GEN_ARGS[@]}" \
   --batch_size "$BATCH_SIZE" \
   "${CHAT_ARGS[@]}" \
   --output_path "$OUT" \

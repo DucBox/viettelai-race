@@ -1,0 +1,43 @@
+# Custom lm-eval task: GPQA-Diamond zero-shot, LOG-LIKELIHOOD / forced-choice
+# scoring (output_type: multiple_choice) — no generation, no CoT. Model never
+# writes text; lm-eval compares the log-probability of the 4 literal
+# continuations "A"/"B"/"C"/"D" right after the prompt and picks the highest.
+#
+# This mirrors lm-eval's own official gpqa_diamond_zeroshot task (fetched from
+# EleutherAI/lm-evaluation-harness, lm_eval/tasks/gpqa/zeroshot/
+# _gpqa_zeroshot_yaml — output_type: multiple_choice, doc_to_choice: ["(A)",
+# "(B)", "(C)", "(D)"], metric: acc/acc_norm), but sourced from OUR local
+# data/GPQA/gpqa_diamond.parquet (question+answer already flattened, choices
+# labeled "A." "B." "C." "D." in the question text — not "(A)") instead of the
+# gated Idavidrein/gpqa dataset. doc_to_choice below uses bare letters ("A"
+# not "(A)") to match our data's own labeling convention.
+#
+# Companion to gpqa_diamond_local_cot_zeroshot.yaml.template (generate_until +
+# regex, used by scripts/12 and formerly the default for scripts/13) — run
+# BOTH as a cross-check: generation-based (does the model reason its way to
+# the right answer) vs. forced-choice log-likelihood (does the model's raw
+# distribution over A/B/C/D favor the right one). They can legitimately
+# diverge; neither is automatically "more correct" for every purpose.
+#
+# __GPQA_PARQUET_PATH__ substituted at run time by scripts/13 (or 12, if
+# pointed at this task via TASK=).
+task: gpqa_diamond_local_zeroshot
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    test: __GPQA_PARQUET_PATH__
+test_split: test
+output_type: multiple_choice
+doc_to_text: "{{question}}\nAnswer:"
+doc_to_target: "{{answer}}"
+doc_to_choice: ["A", "B", "C", "D"]
+num_fewshot: 0
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
