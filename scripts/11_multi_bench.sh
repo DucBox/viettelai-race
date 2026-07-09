@@ -53,11 +53,12 @@ cd "$(dirname "$0")/.."
 # Every flag here is just appended to `vllm serve` verbatim by serve_up.sh, so
 # anything `vllm serve --help` accepts is a valid row.
 EXPERIMENTS=(
-  "$(printf 'baseline\t\t')"                                        # untouched BF16 reference
-  "$(printf 'fp8\t--quantization fp8\t')"                           # on-the-fly W8A8 FP8 weights
-  "$(printf 'fp8_kv\t--kv-cache-dtype fp8\t')"                      # FP8 KV cache (weights stay BF16)
-  "$(printf 'fp8_both\t--quantization fp8 --kv-cache-dtype fp8\t')" # FP8 weights + FP8 KV cache
-  "$(printf 'chunked_prefill\t--enable-chunked-prefill\t')"         # split long prefills into chunks
+  "$(printf 'baseline\t\t')"                                                                   # untouched BF16 reference
+  "$(printf 'fp8_dynamic_ckpt\t\tMODEL_DIR=./models/qwen3.5-2b-fp8-dynamic')"                   # offline FP8_DYNAMIC checkpoint (llm-compressor), quantization auto-detected from config.json
+  # "$(printf 'fp8\t--quantization fp8\t')"                           # on-the-fly W8A8 FP8 weights
+  # "$(printf 'fp8_kv\t--kv-cache-dtype fp8\t')"                      # FP8 KV cache (weights stay BF16)
+  # "$(printf 'fp8_both\t--quantization fp8 --kv-cache-dtype fp8\t')" # FP8 weights + FP8 KV cache
+  # "$(printf 'chunked_prefill\t--enable-chunked-prefill\t')"         # split long prefills into chunks
   # "$(printf 'no_prefix\t--no-enable-prefix-caching\t')"           # measure without prefix cache
   # "$(printf 'more_seqs\t--max-num-seqs 64\tGPU_MEM_UTIL=0.95')"   # bigger batch + example extra env
 )

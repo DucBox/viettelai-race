@@ -214,11 +214,12 @@ def main():
     recipe = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=IGNORE)
     oneshot(model=model, recipe=recipe)
 
-    try:
-        from compressed_tensors.offload import dispatch_model
-        dispatch_model(model)
-    except Exception as e:  # noqa: BLE001
-        print(f"   (dispatch_model skipped: {e})")
+    # No dispatch_model() call here: the model is already single-device
+    # (device_map={"": 0} at load, see load_model()) with no offload, so
+    # there's nothing to re-dispatch. Calling it anyway previously triggered
+    # a CUDA device-side assert (indexSelectSmallIndex) in embed_tokens
+    # during generate — exactly the accelerate-dispatch-hook failure mode
+    # load_model()'s device_map choice was meant to avoid in the first place.
 
     text = sanity_generate(model, tokenizer, "AFTER quantize, FP8")
     if len(text.strip()) < 5:
