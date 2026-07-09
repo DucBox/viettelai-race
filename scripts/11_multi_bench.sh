@@ -36,8 +36,14 @@
 # (thermal, background load) hits every config equally instead of biasing
 # whichever one happened to run first or last.
 #
-# Env: MODE (default replay), REPEATS (default 1), URL, SERVED_MODEL_NAME —
-#      forwarded to every row so the comparison is apples-to-apples.
+# WHY STOP_AFTER_EACH (default on): each row's server is stopped right after
+# its own ERS is computed, instead of sitting idle-but-loaded until the NEXT
+# row's serve_up.sh kills it — the GPU actually goes idle between rows. Set
+# STOP_AFTER_EACH=0 to keep the old behavior (server stays up between rows).
+#
+# Env: MODE (default replay), REPEATS (default 1), STOP_AFTER_EACH (default 1),
+#      URL, SERVED_MODEL_NAME — forwarded to every row so the comparison is
+#      apples-to-apples.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -123,8 +129,14 @@ for row in "${EXPERIMENTS[@]}"; do
   echo ">> EXTRA_VLLM_ARGS = ${args:-<none>}"
   echo ">> extra env       = ${extra:-<none>}"
 
-  # scope env to this e2e invocation; MODE forwarded from our env
+  # scope env to this e2e invocation; MODE forwarded from our env. STOP_AFTER=1
+  # by default so the server this row started gets torn down right after ITS
+  # own ERS is computed — GPU actually goes idle between rows instead of the
+  # previous row's server sitting there alive until the NEXT row's
+  # serve_up.sh kills it. Set STOP_AFTER_EACH=0 to go back to that (leave
+  # every row's server running for the next row to kill).
   EXP_ENV=(EXTRA_VLLM_ARGS="$args" MODE="$MODE")
+  [[ "${STOP_AFTER_EACH:-1}" == "1" ]] && EXP_ENV+=(STOP_AFTER=1)
   # shellcheck disable=SC2206
   [[ -n "${extra// }" ]] && EXP_ENV+=($extra)
 

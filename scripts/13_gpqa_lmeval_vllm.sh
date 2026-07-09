@@ -91,39 +91,11 @@ if curl -fsS "http://localhost:8000/health" >/dev/null 2>&1; then
     sleep 3
   else
     echo ">> KILL_SERVER=1 — a server is up on :8000, stopping it first ..."
-    PIDFILE="serve/.vllm.pid"
-    if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-      OLD_PID="$(cat "$PIDFILE")"
-      echo ">> Stopping native vllm serve (pid $OLD_PID) ..."
-      kill "$OLD_PID" 2>/dev/null || true
-      for _ in $(seq 1 30); do
-        kill -0 "$OLD_PID" 2>/dev/null || break
-        sleep 1
-      done
-      if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo ">> Still alive after 30s — SIGKILL ..."
-        kill -9 "$OLD_PID" 2>/dev/null || true
-        sleep 2
-      fi
-    elif docker ps -q --filter name=vllm-qwen35 2>/dev/null | grep -q .; then
-      echo ">> Stopping docker container vllm-qwen35 ..."
-      docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
-      sleep 2
-    elif [[ -f serve/docker-compose.yml ]] && (cd serve && docker compose ps -q vllm 2>/dev/null | grep -q .); then
-      echo ">> Stopping docker compose service 'vllm' ..."
-      ( cd serve && docker compose stop vllm ) || true
-      sleep 2
-    else
-      echo "!! KILL_SERVER=1 but couldn't identify how it was started (no"
-      echo "   serve/.vllm.pid, no vllm-qwen35 container, no compose service)."
-      echo "   Kill it manually, or Ctrl-C now."
-      sleep 3
-    fi
+    ./scripts/stop_server.sh
     if curl -fsS "http://localhost:8000/health" >/dev/null 2>&1; then
       echo "!! Server still responding after stop attempt — aborting to avoid GPU conflict." >&2
       exit 1
     fi
-    echo ">> Server stopped."
   fi
 fi
 

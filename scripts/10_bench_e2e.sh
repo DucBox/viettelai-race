@@ -24,6 +24,14 @@
 #                             a lightweight alternative to a full restart
 #   SKIP_LOAD=1               reuse the most recent artifacts/<run>, don't re-run AIPerf
 #                             (implies SKIP_SERVE — never restarts when reusing)
+#   STOP_AFTER=1              stop the server (scripts/stop_server.sh) after ERS is
+#                             computed — only if THIS run started it fresh in step 0
+#                             (never touches a server left up via SKIP_SERVE). Use this
+#                             so the GPU actually goes idle between runs instead of a
+#                             server sitting there until the NEXT run's serve_up.sh
+#                             kills it — e.g. to let scripts/13's separate engine run
+#                             without a KILL_SERVER=1 fight. 11_multi_bench.sh sets
+#                             this for every row by default.
 #   URL, SERVED_MODEL_NAME    target server (default localhost:8000 / qwen3.5-2b)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -57,6 +65,7 @@ SECTION() { printf '\n\033[1m========== %s ==========\033[0m\n' "$1"; }
 # ── 0. fresh server (cold, fair, repeatable) ─────────────────────────────────
 # Reusing artifacts (SKIP_LOAD) never touches the server, so never restart then.
 if [[ "${SKIP_LOAD:-0}" == "1" ]]; then SKIP_SERVE=1; fi
+WE_STARTED_SERVER=0
 if [[ "${SKIP_SERVE:-0}" == "1" ]]; then
   SECTION "0/3  SERVE  (SKIP_SERVE — using the already-running server)"
   if [[ "${RESET_CACHE:-0}" == "1" ]]; then
@@ -68,6 +77,7 @@ if [[ "${SKIP_SERVE:-0}" == "1" ]]; then
 else
   SECTION "0/3  SERVE  (fresh cold restart via serve_up.sh)"
   ./scripts/serve_up.sh
+  WE_STARTED_SERVER=1
 fi
 
 # ── 1. drive load ────────────────────────────────────────────────────────────
@@ -93,3 +103,11 @@ SECTION "2/3  PER-REQUEST REPORT (07)"
 # ── 3. ERS ───────────────────────────────────────────────────────────────────
 SECTION "3/3  ERS (08)"
 "$PY" scripts/08_ers_score.py "$RUN_DIR"
+
+# ── stop (optional) ──────────────────────────────────────────────────────────
+# Only stop a server THIS run started — never touch one left up via SKIP_SERVE,
+# that's the caller's to manage.
+if [[ "${STOP_AFTER:-0}" == "1" && "$WE_STARTED_SERVER" == "1" ]]; then
+  SECTION "STOP  (STOP_AFTER=1 — freeing the GPU until the next run)"
+  ./scripts/stop_server.sh
+fi
