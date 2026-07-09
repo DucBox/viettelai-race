@@ -20,6 +20,16 @@
 # the standardized prompt+scoring pipeline works; revisit if letter-position
 # bias turns out to matter for your numbers.
 #
+# DEVIATION from the official filter_list: the official "flexible-extract"
+# filter uses function "multi_choice_regex", which reads doc["choices"] (a
+# list of the 4 answer texts) internally — populated there by process_docs().
+# We have no process_docs (no raw per-choice columns to build it from), so
+# doc["choices"] doesn't exist here -> multi_choice_regex crashes with
+# `KeyError: 'choices'`. Swapped for a plain "regex" filter matching "(X)"
+# and taking the LAST match (group_select: -1) instead — same intent (find
+# the model's final stated letter, not an earlier one mentioned while
+# reasoning), no dependency on a choices list.
+#
 # __GPQA_PARQUET_PATH__ is a placeholder — scripts/12_gpqa_lmeval.sh
 # substitutes it with the real absolute path at run time and writes the
 # result to the sibling (gitignored) .yaml file next to this .template.
@@ -40,11 +50,9 @@ filter_list:
       - function: "take_first"
   - name: "flexible-extract"
     filter:
-      - function: "multi_choice_regex"
+      - function: "regex"
+        regex_pattern: "(\\([A-Da-d]\\))"
         group_select: -1
-        ignore_case: true
-        ignore_punctuation: true
-        regex_pattern: "(\\([A-Z]\\))"
       - function: "take_first"
 generation_kwargs:
   until:
