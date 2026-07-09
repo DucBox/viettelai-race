@@ -16,7 +16,7 @@ see docs/llm-compressor-quantization-guide.md). That checkpoint's
 quantization_config.ignore, once you collapse the per-layer expansion back to
 patterns, is exactly:
 
-    ignore = ["lm_head", "re:^mtp.*", "re:.*visual.*", "re:.*linear_attn.*"]
+    ignore = ["lm_head", "re:.*embed_tokens$", "re:^mtp.*", "re:.*visual.*", "re:.*linear_attn.*"]
 
 i.e. the ENTIRE Gated DeltaNet mixer (in_proj_qkv/in_proj_z/out_proj/in_proj_a/
 in_proj_b — not just the tiny gates) stays BF16, along with the tied lm_head,
@@ -56,6 +56,10 @@ def h(title):
 IGNORE = [
     "lm_head",           # tied to embed_tokens (nn.Embedding — never matches
                          # targets="Linear" anyway, listed for clarity/safety)
+    "re:.*embed_tokens$",  # same tied tensor, listed for parity with the real
+                           # RedHatAI recipe.yaml (belt-and-suspenders: also
+                           # nn.Embedding, so this never matches targets="Linear"
+                           # either — harmless either way)
     "re:^mtp.*",         # speculative-decode draft head, 2.7% of params
     "re:.*visual.*",     # vision tower, dead weight for the text-only trace
     "re:.*linear_attn.*",  # ENTIRE Gated DeltaNet mixer — see module docstring
