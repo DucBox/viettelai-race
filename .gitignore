@@ -34,6 +34,9 @@ bench/bench_results/
 data/trace-round1.jsonl
 data/trace-round1.short.jsonl
 
+# Raw GPQA-diamond dump — redundant with the tracked data/GPQA/ copy; local only
+gpqa_diamond.csv
+
 # serve_up.sh native-mode runtime state
 serve/.vllm.pid
 serve/vllm.log
