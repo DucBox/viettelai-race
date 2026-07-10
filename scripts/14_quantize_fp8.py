@@ -9,6 +9,9 @@
     python3 scripts/14_quantize_fp8.py
     python3 scripts/14_quantize_fp8.py --model-dir serve/models/qwen3.5-2b \
         --out serve/models/qwen3.5-2b-fp8-dynamic
+    python3 scripts/14_quantize_fp8.py --calib   # static FP8, activation scales
+                                                 # CALIBRATED on the round-1 trace
+                                                 # (an A/B candidate vs dynamic)
 
 RECIPE — NOT a guess, copied from a REAL published checkpoint of the SAME
 model family: RedHatAI/Qwen3.5-4B-FP8-dynamic (config.json read directly,
@@ -35,9 +38,37 @@ verification table (real param counts ignored vs quantized) before running —
 so a config mismatch (wrong model, wrong arch) fails loud before burning GPU
 time, instead of silently quantizing the wrong thing.
 
+CALIBRATION (--calib) — read this before assuming calib = better:
+  The DEFAULT path is FP8_DYNAMIC, which is DATA-FREE. FP8 weight scales are
+  max-abs (data-independent), and activations are scaled per-token at runtime,
+  so a calibration dataset changes NOTHING there — feeding one in would be
+  theatre. Calibration only bites if you switch the ACTIVATION scheme to static.
+  That is what --calib does: scheme=FP8 (static per-tensor W8A8) with activation
+  scales frozen from a calibration set. Static per-tensor activations are
+  usually a hair LESS accurate than dynamic per-token, so --calib is an A/B
+  CANDIDATE vs the dynamic default, not a guaranteed win — quantize both,
+  compare GPQA (scripts/12), keep the winner.
+
+  WHICH calibration set (--calib-set): the competition grades ACCURACY on GPQA
+  and SPEED on the trace SEPARATELY. Static scales are frozen at calib time, so
+  they must fit the distribution where accuracy is graded = GPQA. Calibrating on
+  the trace (word-salad tech English) was measured to DROP GPQA accuracy: at
+  eval the dense-scientific-English activations fall outside the trace-fit range
+  and clip. The trace half only scores latency + non-empty output (ERS ignores
+  correctness), so it does not need correct activation scales. Hence the default
+  --calib-set=gpqa builds the calibration set from data/GPQA/gpqa_diamond.parquet
+  reproducing the EXACT eval prompt (scripts/12's system_instruction + the
+  "{{question}}\nLet's think step by step: " template through the chat template),
+  so calib-time activations match eval-time activations. (--calib-set=trace is
+  kept only to reproduce the accuracy-drop A/B.) Caveat: calibrating on the eval
+  set fits the test distribution — legitimate here because BTC grades on it, but
+  fragile if the final accuracy set differs; FP8_DYNAMIC sidesteps this entirely.
+
 Env:
     MODEL_DIR   default serve/models/qwen3.5-2b
-    OUT_DIR     default <MODEL_DIR>-fp8-dynamic
+    OUT_DIR     default <MODEL_DIR>-fp8-dynamic (or -fp8-static-calib-<set> with --calib)
+    CALIB_SET   gpqa (default) | trace          (only used with --calib)
+    CALIB_DATA  default per set: data/GPQA/gpqa_diamond.parquet | data/trace-round1.jsonl
 """
 import argparse
 import json
@@ -78,6 +109,20 @@ EXTRA_FILES = [
 ]
 
 SANITY_PROMPT = "In one sentence, what is prefix caching in LLM serving?"
+
+# Copied VERBATIM from scripts/12_gpqa_lmeval.sh's default SYSTEM_INSTRUCTION —
+# the calibration prompt must reproduce the eval-time prompt exactly, system
+# message included, or the static activation scales won't match what the server
+# sees at grading time. If you change it in scripts/12, change it here too.
+GPQA_SYSTEM_INSTRUCTION = (
+    "You are an expert scientist. Reason through the problem step by step, then "
+    "end your response with exactly this sentence on its own line: The answer is "
+    "(X) — replacing X with the correct letter."
+)
+# doc_to_text from the local task YAML (bench/lmeval_tasks/gpqa_diamond_local/):
+# the parquet's `question` already has the 4 choices baked in, so the template
+# just appends this suffix. Kept identical so calib prompts == eval prompts.
+GPQA_USER_SUFFIX = "\nLet's think step by step: "
 
 
 def matches_ignore(name, patterns):
@@ -156,6 +201,83 @@ def preflight_report(model, cfg):
     return quantized_params, ignored_params
 
 
+def _tokenize_texts(tokenizer, texts, num_samples, max_seq_len):
+    """Deterministic subsample (if capped) + tokenize into a datasets.Dataset."""
+    import random
+
+    from datasets import Dataset
+
+    if num_samples and num_samples < len(texts):
+        random.Random(42).shuffle(texts)
+        texts = texts[:num_samples]
+    rows = []
+    for t in texts:
+        enc = tokenizer(t, truncation=True, max_length=max_seq_len, add_special_tokens=False)
+        rows.append({"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]})
+    return Dataset.from_list(rows)
+
+
+def build_gpqa_calib(tokenizer, path, num_samples, max_seq_len, system_instruction):
+    """Calibration set that reproduces the EXACT GPQA eval prompt so the frozen
+    static activation scales match what the server sees at grading time. Mirrors
+    scripts/12_gpqa_lmeval.sh: system=<expert-scientist instruction>, user=the
+    parquet's `question` (choices already baked in) + GPQA_USER_SUFFIX, rendered
+    through the model's own chat template with the generation prompt appended —
+    just like /v1/chat/completions does at eval. Reads the SAME parquet the eval
+    consumes (not the raw CSV), so choice order/lettering can't drift."""
+    from datasets import load_dataset
+
+    if not os.path.isfile(path):
+        sys.exit(f"!! --calib-data {path} not found (expected data/GPQA/gpqa_diamond.parquet).")
+    ext = os.path.splitext(path)[1].lower()
+    fmt = "parquet" if ext == ".parquet" else "json" if ext in (".jsonl", ".json") else None
+    if fmt is None:
+        sys.exit(f"!! GPQA calib expects .parquet or .jsonl, got {ext}")
+    raw = load_dataset(fmt, data_files=path, split="train")
+    if "question" not in raw.column_names:
+        sys.exit(f"!! {path} has no `question` column (cols={raw.column_names}) — wrong file?")
+    texts = []
+    for rec in raw:
+        q = rec.get("question")
+        if not q:
+            continue
+        msgs = []
+        if system_instruction:
+            msgs.append({"role": "system", "content": system_instruction})
+        msgs.append({"role": "user", "content": q + GPQA_USER_SUFFIX})
+        texts.append(tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True))
+    if not texts:
+        sys.exit(f"!! no usable questions in {path}")
+    return _tokenize_texts(tokenizer, texts, num_samples, max_seq_len)
+
+
+def build_trace_calib(tokenizer, path, num_samples, max_seq_len):
+    """Calibration set = the ACTUAL serving distribution. Each trace record's
+    body.messages is rendered through the model's own chat template exactly as
+    it will be at serve time, then tokenized. The trace's built-in redundancy
+    (20 sessions x 6 snapshots, one shared system prompt) is KEPT on purpose:
+    it weights the activation statistics by what the server really sees, which
+    is the whole point of calibrating on-distribution rather than on ultrachat.
+    NOTE: trace-calib is measured to DROP GPQA accuracy (see module docstring) —
+    kept only to reproduce that A/B; --calib-set=gpqa is the real path."""
+    if not os.path.isfile(path):
+        sys.exit(f"!! --calib-data {path} not found (expected the round-1 trace JSONL).")
+    texts = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            msgs = json.loads(line).get("body", {}).get("messages")
+            if msgs:
+                texts.append(tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=False))
+    if not texts:
+        sys.exit(f"!! no body.messages found in {path} — wrong file?")
+    return _tokenize_texts(tokenizer, texts, num_samples, max_seq_len)
+
+
 def sanity_generate(model, tokenizer, label):
     import torch
 
@@ -186,10 +308,29 @@ def main():
     ap.add_argument("--out", default=os.environ.get("OUT_DIR"))
     ap.add_argument("--skip-baseline-generate", action="store_true",
                      help="skip the pre-quantize generation (saves ~10s, less to compare against)")
+    ap.add_argument("--calib", action="store_true",
+                     help="Static-activation FP8 (scheme=FP8) with activation scales CALIBRATED, "
+                          "instead of the default data-free FP8_DYNAMIC. NOTE (see module docstring): "
+                          "calib does NOT change FP8 weights — only the static activation scales. "
+                          "It's an A/B candidate vs dynamic, not a guaranteed win.")
+    ap.add_argument("--calib-set", choices=["gpqa", "trace"], default=os.environ.get("CALIB_SET", "gpqa"),
+                     help="Calibration distribution. 'gpqa' (default) matches where accuracy is graded; "
+                          "'trace' reproduces the measured accuracy-drop A/B. See module docstring.")
+    ap.add_argument("--calib-data", default=os.environ.get("CALIB_DATA"),
+                     help="Override calib file. Default per --calib-set: "
+                          "gpqa->data/GPQA/gpqa_diamond.parquet, trace->data/trace-round1.jsonl")
+    ap.add_argument("--system-instruction", default=os.environ.get("SYSTEM_INSTRUCTION", GPQA_SYSTEM_INSTRUCTION),
+                     help="System message prepended to each GPQA calib prompt — MUST match scripts/12's "
+                          "SYSTEM_INSTRUCTION so calib activations match eval activations. Set '' to omit.")
+    ap.add_argument("--num-calib-samples", type=int, default=int(os.environ.get("NUM_CALIB_SAMPLES", "0")),
+                     help="Cap on calibration samples (0 = every record; GPQA-diamond is 198, trace is 120).")
+    ap.add_argument("--max-seq-len", type=int, default=int(os.environ.get("MAX_SEQ_LEN", "8192")),
+                     help="Truncate each calibration prompt to this many tokens (only with --calib).")
     args = ap.parse_args()
 
     model_dir = args.model_dir
-    out_dir = args.out or (model_dir.rstrip("/") + "-fp8-dynamic")
+    out_dir = args.out or (model_dir.rstrip("/") +
+                           (f"-fp8-static-calib-{args.calib_set}" if args.calib else "-fp8-dynamic"))
 
     if not os.path.isfile(os.path.join(model_dir, "config.json")):
         sys.exit(f"!! {model_dir}/config.json not found — run scripts/01_check_model.sh first.")
@@ -209,10 +350,28 @@ def main():
     if not args.skip_baseline_generate:
         sanity_generate(model, tokenizer, "BEFORE quantize, BF16 baseline")
 
-    h("QUANTIZE  FP8_DYNAMIC (RTN, data-free)  targets=Linear")
-    print(f"ignore = {IGNORE}")
-    recipe = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=IGNORE)
-    oneshot(model=model, recipe=recipe)
+    if args.calib:
+        default_data = ("data/GPQA/gpqa_diamond.parquet" if args.calib_set == "gpqa"
+                        else "data/trace-round1.jsonl")
+        calib_path = args.calib_data or default_data
+        h(f"QUANTIZE  FP8 (static W8A8, activation scales CALIBRATED on {args.calib_set})  targets=Linear")
+        print(f"ignore = {IGNORE}")
+        print(f"calib set  = {args.calib_set}")
+        print(f"calib data = {calib_path}")
+        if args.calib_set == "gpqa":
+            ds = build_gpqa_calib(tokenizer, calib_path, args.num_calib_samples,
+                                  args.max_seq_len, args.system_instruction)
+        else:
+            ds = build_trace_calib(tokenizer, calib_path, args.num_calib_samples, args.max_seq_len)
+        print(f"calibration samples = {len(ds)}   (max_seq_len={args.max_seq_len})")
+        recipe = QuantizationModifier(targets="Linear", scheme="FP8", ignore=IGNORE)
+        oneshot(model=model, recipe=recipe, dataset=ds,
+                num_calibration_samples=len(ds), max_seq_length=args.max_seq_len)
+    else:
+        h("QUANTIZE  FP8_DYNAMIC (RTN, data-free)  targets=Linear")
+        print(f"ignore = {IGNORE}")
+        recipe = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=IGNORE)
+        oneshot(model=model, recipe=recipe)
 
     # No dispatch_model() call here: the model is already single-device
     # (device_map={"": 0} at load, see load_model()) with no offload, so

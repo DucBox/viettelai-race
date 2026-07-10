@@ -1,0 +1,5 @@
+# Keep the build context to just the model weights.
+docker-compose.yml
+.env
+.env.example
+models/README.md

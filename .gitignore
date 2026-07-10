@@ -38,6 +38,9 @@ data/trace-round1.short.jsonl
 serve/.vllm.pid
 serve/vllm.log
 
+# Submission compose files (reference the pushed Docker Hub image tag) — local only
+/submit/
+
 # misc
 .DS_Store
 __pycache__/
