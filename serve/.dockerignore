@@ -3,3 +3,6 @@ docker-compose.yml
 .env
 .env.example
 models/README.md
+
+# HF download-tool bookkeeping (lock/metadata files), not part of the model
+models/*/.cache/

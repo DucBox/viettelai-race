@@ -1,0 +1,14 @@
+# Submission image for Viettel AI Race — Track 3, AWQ 4-bit checkpoint variant.
+# Same base/platform rules as Dockerfile (see there for the full rationale):
+# bakes weights into the image at build time, forced linux/amd64 since the
+# MIG H200 grading server is a standard x86_64 datacenter GPU box.
+#
+# Build from the serve/ directory:
+#   cd serve
+#   docker build -f Dockerfile.awq4bit --platform linux/amd64 \
+#     -t <dockerhub-user>/qwen35-2b-race-awq4bit:v1 .
+#   docker push <dockerhub-user>/qwen35-2b-race-awq4bit:v1
+
+FROM --platform=linux/amd64 vllm/vllm-openai:v0.22.1
+
+COPY models/qwen3.5-2b-awq4bit/ /model/
