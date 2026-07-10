@@ -64,6 +64,20 @@ CALIBRATION (--calib) — read this before assuming calib = better:
   set fits the test distribution — legitimate here because BTC grades on it, but
   fragile if the final accuracy set differs; FP8_DYNAMIC sidesteps this entirely.
 
+KNOWN BUG, FOUND AND FIXED (2026-07-10, found on scripts/15's AWQ output via
+scripts/16's tensor-level diff, then confirmed this script has the identical
+gap since load_model() is byte-for-byte the same function): neither
+AutoModelForImageTextToText nor AutoModelForCausalLM attaches Qwen3_5's `mtp`
+submodule on load (transformers 5.10.2) — `any('mtp' in n for n, _ in
+model.named_modules())` is False for both, despite the BF16 source checkpoint
+genuinely holding 15 `mtp.*` weight keys on disk. The model class silently
+drops them; nothing in the quantize/save pipeline ever sees them, so
+save_pretrained() writes a checkpoint 15 tensors short with no error. FIXED
+below via copy_missing_mtp_tensors(): copies those tensors' raw bytes
+straight from source to output safetensors post-save (no model round-trip
+needed, since `mtp` was always meant to stay untouched BF16 per the
+`re:^mtp.*` ignore entry anyway).
+
 Env:
     MODEL_DIR   default serve/models/qwen3.5-2b
     OUT_DIR     default <MODEL_DIR>-fp8-dynamic (or -fp8-static-calib-<set> with --calib)
@@ -161,6 +175,85 @@ def load_model(model_dir):
             print(f"   {loader_name} failed: {e}")
     sys.exit("!! could not load model with any Auto* class — check transformers version "
              "in .venv-quantize (needs from-source main branch for qwen3_5)")
+
+
+def copy_missing_mtp_tensors(model_dir, out_dir):
+    """Patch `mtp.*` tensors back into the FP8 output, copied verbatim (raw
+    bytes, no model round-trip) from the BF16 source checkpoint.
+
+    CONFIRMED ON GPU (2026-07-10, transformers 5.10.2, found via
+    scripts/16_inspect_quantized_model.py diffed against scripts/15's AWQ
+    output): neither AutoModelForImageTextToText NOR AutoModelForCausalLM
+    attaches the `mtp` submodule when loading Qwen3_5ForConditionalGeneration
+    — `any('mtp' in n for n, _ in model.named_modules())` is False for both,
+    even though the BF16 source checkpoint's model.safetensors.index.json
+    genuinely lists 15 `mtp.*` weight keys and config.json declares
+    `mtp_num_hidden_layers: 1`. Loading only pulls 617 (ImageTextToText) or
+    320 (CausalLM) of the source's 632 tensors — the MTP head is simply never
+    instantiated, so it can't be quantized OR explicitly ignored: it's
+    invisible to the whole pipeline, and save_pretrained() then writes out a
+    checkpoint 15 tensors short with no error or warning. This script's
+    load_model() is identical to scripts/15's, so it has the exact same gap.
+
+    Since `re:^mtp.*` in IGNORE only ever meant "leave this untouched BF16"
+    anyway, the fix doesn't need the model class to support `mtp` at all —
+    copy the original bytes straight from source safetensors to output
+    safetensors, unmodified."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    def read_matching(shard_path, keys=None):
+        out = {}
+        with safe_open(shard_path, framework="pt") as f:
+            for k in f.keys():
+                if keys is None or k in keys:
+                    out[k] = f.get_tensor(k)
+        return out
+
+    src_index = os.path.join(model_dir, "model.safetensors.index.json")
+    src_single = os.path.join(model_dir, "model.safetensors")
+    if os.path.isfile(src_index):
+        with open(src_index) as fh:
+            idx = json.load(fh)
+        mtp_keys = [k for k in idx["weight_map"] if k.startswith("mtp.")]
+        mtp_tensors = {}
+        by_shard = {}
+        for k in mtp_keys:
+            by_shard.setdefault(idx["weight_map"][k], []).append(k)
+        for shard, keys in by_shard.items():
+            mtp_tensors.update(read_matching(os.path.join(model_dir, shard), set(keys)))
+    elif os.path.isfile(src_single):
+        mtp_tensors = read_matching(src_single)
+        mtp_tensors = {k: v for k, v in mtp_tensors.items() if k.startswith("mtp.")}
+    else:
+        sys.exit(f"!! no safetensors found in {model_dir} to recover mtp tensors from")
+
+    if not mtp_tensors:
+        print("  (no mtp.* tensors found in source checkpoint — nothing to patch; "
+              "this model genuinely has no MTP head, or naming differs — verify before trusting this.)")
+        return
+
+    out_single = os.path.join(out_dir, "model.safetensors")
+    out_index = os.path.join(out_dir, "model.safetensors.index.json")
+    if os.path.isfile(out_index):
+        sys.exit("!! output is sharded (model.safetensors.index.json) — "
+                 "copy_missing_mtp_tensors() only handles the single-shard case seen "
+                 "in practice; extend this function before using it on a multi-shard output.")
+    if not os.path.isfile(out_single):
+        sys.exit(f"!! no model.safetensors in {out_dir} — save_pretrained() may have failed")
+
+    existing = read_matching(out_single)
+    already = [k for k in mtp_tensors if k in existing]
+    if already:
+        print(f"  ({len(already)} mtp.* tensors already present in output — save_pretrained "
+              f"picked them up this time, nothing to patch)")
+        return
+
+    merged = {**existing, **mtp_tensors}
+    save_file(merged, out_single, metadata={"format": "pt"})
+    added_bytes = sum(t.numel() * t.element_size() for t in mtp_tensors.values())
+    print(f"  patched {len(mtp_tensors)} mtp.* tensors ({added_bytes/1e6:.1f} MB, BF16 verbatim) "
+          f"into {out_single} — model class dropped them on load, this restores them post-hoc")
 
 
 def preflight_report(model, cfg):
@@ -345,6 +438,15 @@ def main():
     model = load_model(model_dir)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
+    has_mtp = any("mtp" in n for n, _ in model.named_modules())
+    print(f"model has `mtp` submodule loaded: {has_mtp}" + (
+        "" if has_mtp else
+        "  !! KNOWN GAP (confirmed 2026-07-10, transformers 5.10.2): the loader "
+        "class silently drops Qwen3_5's MTP head. Will patch the original BF16 "
+        "mtp.* tensors back in from source safetensors after save — see "
+        "copy_missing_mtp_tensors()."
+    ))
+
     preflight_report(model, cfg)
 
     if not args.skip_baseline_generate:
@@ -395,6 +497,10 @@ def main():
         if os.path.isfile(src) and not os.path.isfile(dst):
             shutil.copy2(src, dst)
             print(f"  copied {f} (not re-emitted by save_pretrained)")
+
+    if not has_mtp:
+        h("PATCH  mtp.* tensors back in (model class dropped them on load)")
+        copy_missing_mtp_tensors(model_dir, out_dir)
 
     def du(path):
         return sum(os.path.getsize(os.path.join(dp, fn))
