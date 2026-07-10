@@ -46,17 +46,43 @@ activations flowing through the smooth_layer -> balance_layers pairs. There
 is no calibration-free AWQ path; skipping --calib is not an option here
 (unlike FP8_DYNAMIC in script 14, which has no calibration flag at all).
 
-ONE THING THE SOURCE CHECKPOINT DOES NOT TELL US: which calibration dataset
-cyankiwi used. Neither recipe.yaml nor config.json records the dataset (only
-the recipe's own hyperparameters are serialized — oneshot()'s `dataset=`
-argument is caller-side, not part of the saved recipe). So exact bit-for-bit
-scale reproduction is NOT possible without guessing their calibration set;
-what IS reproducible exactly is every recipe hyperparameter above. This
-script defaults calibration to the SAME GPQA-matching prompts scripts/12
-evaluates on and scripts/14 --calib already established the rationale for:
-frozen scales (here: weights themselves, not just activation scales) must
-fit the distribution graded for accuracy. See scripts/14's module docstring
-for the fuller argument; the short version is unchanged for AWQ.
+TWO THINGS THAT CANNOT BE REPRODUCED EXACTLY (verified, not assumed):
+
+1. Calibration dataset. Neither recipe.yaml nor config.json records which
+   dataset cyankiwi used — oneshot()'s `dataset=` argument is caller-side,
+   never part of the saved recipe. So exact bit-for-bit scale reproduction
+   is not possible without guessing their calibration set. This script
+   defaults calibration to the SAME GPQA-matching prompts scripts/12
+   evaluates on and scripts/14 --calib already established the rationale
+   for: frozen scales (here: weights themselves, not just activation
+   scales) must fit the distribution graded for accuracy. See scripts/14's
+   module docstring for the fuller argument; the short version is unchanged
+   for AWQ.
+
+2. `balance_exponent: 1`, present on EVERY mapping entry in the real
+   recipe.yaml. The current, real `AWQMapping` dataclass (fetched directly
+   from llm-compressor's live GitHub source,
+   src/llmcompressor/modifiers/transform/awq/mappings.py) has only 3
+   fields: smooth_layer, balance_layers, activation_hook_target — no
+   `balance_exponent`. A GitHub code/commit search for that name in the
+   real repo turned up nothing either. So this is not "an older default we
+   can still set" — no pip-installable llm-compressor build we found
+   accepts this kwarg at all. build_mappings() below omits it; there is no
+   substitute.
+
+NOT a gap, despite looking like one at first — the calibration PIPELINE:
+oneshot()'s own real default is `pipeline="independent"` (verified against
+src/llmcompressor/entrypoints/oneshot.py's signature). Like the dataset,
+recipe.yaml doesn't record which pipeline cyankiwi used either — but unlike
+the dataset, this one doesn't need guessing: "independent" re-infers a
+pipeline PER modifier (pipelines/independent/pipeline.py), giving the
+AWQModifier half real calibration data ("sequential", since it needs actual
+activations for its smoothing grid search) and the paired
+QuantizationModifier half a data-free pass ("datafree", since weight-only
+int4 with an mse observer is computed straight from the weight tensor, no
+forward pass needed). That's the objectively correct split for this exact
+modifier pair, not merely "whatever happens by default" — so relying on it
+(passed explicitly below, not left implicit) carries no reproduction risk.
 
 Env:
     MODEL_DIR   default serve/models/qwen3.5-2b
@@ -366,8 +392,24 @@ def main():
         duo_scaling=True,
         n_grid=20,
     )
+    # pipeline="independent" is llm-compressor's OWN default for oneshot()
+    # (verified against the real signature,
+    # src/llmcompressor/entrypoints/oneshot.py: `pipeline: str | None =
+    # "independent"`), spelled out here instead of left implicit. It is also
+    # the CORRECT choice for this exact modifier pair, not just "whatever
+    # happens by default": CalibrationPipeline (pipelines/independent/
+    # pipeline.py) re-infers a pipeline PER MODIFIER — AWQModifier (the
+    # transform half) requires real calibration data for its smoothing-scale
+    # grid search, so it gets "sequential"; the paired QuantizationModifier
+    # here is weight-only (no input/output_activations), so its int4 group
+    # scale/zero-point (mse observer) is computed straight from the weight
+    # tensor with no forward pass needed, so it gets "datafree". Passing
+    # pipeline="sequential" directly would force BOTH through one data
+    # pipeline, wasting a pass and NOT matching how llm-compressor's own
+    # default would run this recipe.
     oneshot(model=model, recipe=recipe, dataset=ds,
-            num_calibration_samples=len(ds), max_seq_length=args.max_seq_len)
+            num_calibration_samples=len(ds), max_seq_length=args.max_seq_len,
+            pipeline="independent")
 
     text = sanity_generate(model, tokenizer, "AFTER quantize, AWQ INT4")
     if len(text.strip()) < 5:
