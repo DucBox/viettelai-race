@@ -100,9 +100,14 @@ def main():
             rec.update(wait_prefill=wp, wait_decode=wd, sched_ovhd=so,
                        err_t2b=abs(q - (wp + wd + so)))
             # PREFILL: iterations trong [scheduled_ts, first_token_ts]
+            # engine thêm hậu tố "-<hex>" vào request_id cho scheduler
+            # (sched pref_id = "chatcmpl-XXXX-YYYY", rests rid = "chatcmpl-XXXX")
+            # -> match theo prefix.
+            def _owns(pid):
+                return pid == rid or (pid or "").startswith(rid + "-") or (pid or "").rsplit("-", 1)[0] == rid
             own = 0.0
             for x in window_rows(ss, ft):
-                if rid in (x.get("pref_ids") or []):
+                if any(_owns(pid) for pid in (x.get("pref_ids") or [])):
                     own += x["exec_gap_ms"]
             rec.update(own_compute=own, interleave=p - own)
 

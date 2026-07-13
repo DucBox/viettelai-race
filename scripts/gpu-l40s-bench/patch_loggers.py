@@ -4,7 +4,8 @@
 # request (Prometheus /metrics chi cho aggregate). merge_request_metrics.py se
 # join cac dong REQSTAT nay voi client replay theo server_request_id.
 # Idempotent: chay lai nhieu lan khong nhan doi patch.
-path = "/usr/local/lib/python3.12/dist-packages/vllm/v1/metrics/loggers.py"
+import vllm.v1.metrics.loggers as _lg
+path = _lg.__file__  # path-agnostic: hoạt động cả khi vLLM cài trong venv/site-packages
 with open(path) as f:
     content = f.read()
 
