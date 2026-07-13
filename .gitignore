@@ -44,6 +44,9 @@ serve/vllm.log
 # Submission compose files (reference the pushed Docker Hub image tag) — local only
 /submit/
 
+# Local bench outputs (traces, replay json, profiler dumps) — regenerated per GPU run
+/output/
+
 # misc
 .DS_Store
 __pycache__/
