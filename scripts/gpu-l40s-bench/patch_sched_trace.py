@@ -39,12 +39,17 @@ if _t_os.environ.get("SCHED_TRACE"):
                 d = getattr(out, "num_scheduled_tokens", {}) or {}
                 nst = sum(d.values())
             n_pref = 0
+            pref_ids = []
             for r in self.running:
                 try:
                     if r.num_computed_tokens < r.num_prompt_tokens:
                         n_pref += 1
+                        pref_ids.append(getattr(r, "request_id", None))
                 except Exception:
                     pass
+            new_ids = []
+            for r in (getattr(out, "scheduled_new_reqs", []) or []):
+                new_ids.append(getattr(r, "req_id", getattr(r, "request_id", None)))
             gap = (_a - _t_last[0]) * 1000 if _t_last[0] is not None else 0.0
             _t_f.write(_t_json.dumps({
                 "t": round(_b, 6),
@@ -55,6 +60,8 @@ if _t_os.environ.get("SCHED_TRACE"):
                 "n_new_admit": len(getattr(out, "scheduled_new_reqs", []) or []),
                 "n_prefilling": n_pref,
                 "tokens_sched": int(nst),
+                "new_ids": new_ids,      # request_id admit trong step (correlate queue)
+                "pref_ids": pref_ids,    # request_id đang prefill (correlate prefill-interleave)
             }) + "\\n")
             _t_f.flush()
             _t_last[0] = _b
