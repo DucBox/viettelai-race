@@ -9,6 +9,9 @@ set -u
 OUT=/root/ab_fp8
 REPS=${REPS:-3}
 mkdir -p "$OUT"
+# ENV ổn định: pin core server<->client (source env_setup.sh trước để có env_pins.sh)
+[ -f /root/env_pins.sh ] && source /root/env_pins.sh
+SRV_PIN=${SRV_PIN:-}; CLI_PIN=${CLI_PIN:-}
 
 kill_server() {
   pkill -15 -f "vllm.entrypoints.openai.api_server" 2>/dev/null
@@ -35,7 +38,7 @@ snap_gpu() {
 start_server() {
   local cfg=$1 log=$2 EXTRA=""
   [ "$cfg" = "fp8" ] && EXTRA="--kv-cache-dtype=fp8 --calculate-kv-scales --quantization=fp8"
-  VLLM_LOGGING_LEVEL=INFO nohup /usr/bin/python3 -m vllm.entrypoints.openai.api_server \
+  VLLM_LOGGING_LEVEL=INFO nohup $SRV_PIN /usr/bin/python3 -m vllm.entrypoints.openai.api_server \
     --model=/root/model --served-model-name=Qwen3.5-2B --host=0.0.0.0 --port=8000 \
     --max-model-len=48000 --gpu-memory-utilization=0.37 --tensor-parallel-size=1 \
     --enable-prefix-caching --language-model-only --max-num-seqs=20 $EXTRA \
@@ -68,8 +71,11 @@ run_one() {
   echo "[warmup] $(tail -1 $OUT/${cfg}_rep${rep}_warmup.txt)"
   sleep 2
   # BENCH: replay 120-req + sampler 0.5s
-  /usr/bin/python3 /root/replay_trace_detailed.py > "$OUT/${cfg}_rep${rep}_replay.txt" 2>&1
+  $CLI_PIN /usr/bin/python3 /root/replay_trace_detailed.py > "$OUT/${cfg}_rep${rep}_replay.txt" 2>&1
   cp /root/replay_detailed_samples.json "$OUT/${cfg}_rep${rep}_samples.json" 2>/dev/null
+  # ENV GATE: env nhiễu (throttle/clock) -> cảnh báo để chạy lại rep, không đưa vào median
+  /usr/bin/python3 /root/env_gate.py --samples "$OUT/${cfg}_rep${rep}_samples.json" \
+    || echo "  ⚠️⚠️  [$cfg rep$rep] ENV GATE FAIL — rep này KHÔNG đáng tin, nên chạy lại"
   cp /root/replay_detailed_requests.json "$OUT/${cfg}_rep${rep}_requests.json" 2>/dev/null
   # MERGE server REQSTAT (queue/prefill/decode/tpot/cached)
   /usr/bin/python3 /root/merge_request_metrics.py --requests /root/replay_detailed_requests.json \

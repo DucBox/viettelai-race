@@ -179,6 +179,30 @@ reconcile_trace.py --full $O/full.json --rests $O/rests.jsonl --sched $O/sched.j
 ⚠️ Còn hộp đen chưa tách: `frontend_prep` gộp tokenize+hash+handoff (muốn tách nữa cần thêm
 timestamp tại API-server trước/sau tokenize); `own_compute` cần chạy kèm 1 profile-pass để đổ về kernel.
 
+## 7. ENV ỔN ĐỊNH (điều kiện để A/B CÓ NGHĨA)
+
+> Mọi rep phải chạy cùng 1 env make-sense, nếu không A/B vô nghĩa. **CPU giờ là
+> hạng nhất** vì residual=tokenize CPU-bound (~35% TTFT) — chỉ khóa GPU là chưa đủ.
+
+| file | vai trò |
+|---|---|
+| `env_setup.sh` | chạy 1 LẦN sau khi thuê: check GPU độc quyền, **khóa GPU clock** (best-effort), **CPU governor=performance**, **chia core server↔client** → xuất `$SRV_PIN`/`$CLI_PIN` (taskset). `source env_setup.sh` |
+| `env_gate.py` | per-rep: đọc `*_samples.json` → FAIL nếu **cpu_throttle>1%** / **sm_clock tụt>5%** / neighbor ồn → driver chạy lại rep đó |
+
+**Tích hợp driver** (mẫu ở `run_ab_fp8.sh`): `source /root/env_pins.sh`; serve = `$SRV_PIN <vllm>`;
+replay = `$CLI_PIN <replay>`; sau replay gọi `env_gate.py` → rep FAIL thì loại khỏi median.
+
+**Quy trình chuẩn khi thuê GPU:**
+```
+source env_setup.sh          # khóa clock + governor + core split (1 lần)
+# rồi mọi run_ab_*.sh tự source env_pins.sh, pin core, gate mỗi rep
+```
+⚠️ Rented thường **cấm khóa GPU clock** → env_gate là chốt chặn (loại rep bị boost-drift).
+Nếu GPU không khóa được clock và boost dao động rộng, nới `--sm-clock-drop 0.08`.
+⚠️ Box **<6 core** → không tách được server/client → residual nhiễu → A/B TTFT kém tin.
+**Nên thuê box ≥6 core, GPU độc quyền.** reconcile_trace cho biết nhiễu rơi vào nhánh nào
+(residual/client_transport tăng = CPU hỏng; queue/prefill ổn) → chẩn đoán env ngay.
+
 ## 5. Điểm submit đã biết (results.csv)
 - v12 (seqs32, default) = 29.71 | v23 (seqs32 + batch3216) = 29.92 (batch giúp TTFT tail)
 - **v20 (seqs20 + batch6144) = 44.09** | v21 (seqs20 + batch8192) = 43.32
