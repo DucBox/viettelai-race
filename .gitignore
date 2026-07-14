@@ -51,3 +51,6 @@ serve/vllm.log
 .DS_Store
 __pycache__/
 *.pyc
+
+# Vendored vLLM source clone (read-only reference for tracing, not project source)
+/vendor/

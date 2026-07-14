@@ -3,10 +3,185 @@
 Kim chỉ nam tối ưu serving. Ràng buộc cứng: **chỉ được serve bằng vLLM**, không đổi
 engine. Mọi thứ dưới đây đều xoay quanh các cờ của vLLM.
 
-> Ghi nhớ khung cảnh: **single GPU, prefill-bound** (prefill:decode ~95:1), điểm
-> mất nhiều nhất ở **round-1 cold start** (20 request × ~13k token dồn trong 475ms).
-> Cửa điểm: TTFT F=100/C=1500ms (γ=2, rộng), TPOT F=20/C=45ms (hẹp). Decode hiện
-> gần sát trần điểm → ưu tiên tuyệt đối là **prefill/TTFT**.
+> Cập nhật sau trace vLLM 0.24.0 + kết quả v26-v31: model vẫn có rất nhiều việc
+> prefill, nhưng **recipe thắng điểm hiện tại không còn là "tối ưu TTFT bằng mọi
+> giá"**. Với hàm điểm này, v26/v31 thắng vì giữ **TPOT/TBT = 16ms** bằng
+> `--max-num-seqs=10`, chấp nhận TTFT p50 ~9.3s. Phần dưới có vài đoạn lịch sử từ
+> giai đoạn v0.22/v12-v23; khi xung đột, ưu tiên section v26/v31 ngay sau đây.
+
+## -1. V26/V31: breakdown TTFT/TPOT -> tối ưu từng component
+
+Mình không coi là "nắm hết vLLM tuyệt đối" theo nghĩa mọi nhánh engine trên mọi
+model, nhưng với bài này thì đã trace đủ các đường nóng cần quyết định:
+
+- V1 scheduler/admission: `v1/core/sched/scheduler.py`.
+- KV/cache manager + watermark/prefix hit: `v1/core/kv_cache_manager.py`.
+- CLI -> config: `engine/arg_utils.py`, `config/cache.py`, `config/scheduler.py`.
+- Qwen3.5 hybrid guard: `model_executor/models/qwen3_5.py`.
+- Mamba/GDN alignment: `config/vllm.py`.
+- GDN prefill backend: `model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`.
+
+### -1.1 TTFT gồm những gì
+
+TTFT client không phải một cục "prefill". Với AIPerf, nên tách như sau:
+
+```
+TTFT_client
+= client_queue
++ http_ingress
++ request_parse/chat_template/tokenizer
++ engine_enqueue
++ server_queue/admission
++ prefix_cache_hash_lookup
++ prefill_scheduling_wait
++ prefill_compute_chunks
++ KV/GDN_state_write
++ first_decode_or_prefill_output_step
++ detokenize/SSE_flush_first_token
+```
+
+Trong đó `client_queue` của AIPerf là thời gian request nằm ở phía load generator
+trước khi tới server. Phần **server queue** nằm bên trong TTFT, không hiện riêng
+nếu chỉ nhìn CSV tổng.
+
+| Component | vLLM path nóng | Cờ tác động | Kết luận cho v26/v31 |
+|---|---|---|---|
+| Client queue | ngoài vLLM | không tune bằng compose server | Chỉ dùng để đọc kết quả; đừng nhầm với queue nội bộ scheduler. |
+| HTTP ingress + JSON parse | OpenAI API server | `--no-enable-log-requests`, `--disable-log-stats`, `--stream-interval` | v31 đã đo: logging hygiene gần như neutral, TTFT p50 9290->9284, p95 11670->11666. |
+| Tokenizer/chat template | tokenizer pool + request preprocess | `--tokenizer-pool-size`, `--tokenizer-pool-type`, chat-template args | Với prompt dài, tokenize có thật nhưng nhỏ hơn prefill. Không nên tăng tokenizer pool nếu CPU contention/IPC tăng. |
+| Engine enqueue | async engine/core | `--async-scheduling` | v17 giảm TBT 1ms nhưng xấu TTFT trên v0.22. Với v31/seqs=10 có thể A/B, chưa phải mặc định. |
+| Server queue/admission | scheduler waiting/running loop | `--max-num-seqs`, `--max-num-batched-tokens`, `--watermark`, `--prefill-schedule-interval` | `max-num-seqs=10` là đòn điểm chính: queue/TTFT xấu hơn, nhưng TBT thắng lớn. Không nâng lên 20/128 cho score hiện tại. |
+| Prefix lookup | KV cache manager + hybrid connector | `--enable-prefix-caching`, `--prefix-caching-hash-algo`, Mamba cache mode | Giữ `--enable-prefix-caching`. Không set `--mamba-cache-mode=all`: Qwen3.5 v0.24 hard-reject. |
+| Prefill chunk admission | scheduler token budget + Mamba alignment | `--max-num-batched-tokens`, `--enable-chunked-prefill`, `--long-prefill-token-threshold`, partial-prefill flags | V26 dùng `2174` để vượt ngưỡng 2 block Mamba/FP8 KV (`2*1072=2144`) với headroom nhỏ. Đây là knob TTFT chính còn lại. |
+| Prefill kernels | attention + GDN linear attention + GEMM | `--quantization=fp8`, `--kv-cache-dtype=fp8`, `--gdn-prefill-backend=flashinfer`, compile/cudagraph | Giữ FP8 weight, FP8 KV, FlashInfer GDN. v0.24 cải thiện ở kernel/runner hơn là scheduler defaults. |
+| KV/GDN write | cache block allocator + recurrent state | `--kv-cache-dtype`, `--mamba-cache-dtype`, `--gpu-memory-utilization`, `--block-size` | Không memory-bound nặng. FP8 KV ở đây còn ảnh hưởng block size 1072, nên nếu bỏ FP8 KV phải retune batch token từ đầu. |
+| First token output | sampler + output processor + detokenize | sampling params, structured output flags, logging | Không dùng structured output/speculative nếu không bắt buộc. |
+
+### -1.2 TPOT/TBT gồm những gì
+
+TPOT là vòng lặp decode sau token đầu, chịu tác động khác TTFT:
+
+```
+TPOT_client
+= scheduler_tick_wait
++ decode_batch_build
++ graph_or_kernel_dispatch_overhead
++ per_token_attention_read_KV
++ per_token_GDN/Mamba_state_update
++ logits/sampler
++ output_processor
++ detokenize
++ network_stream_flush
+```
+
+Với v26/v31, TBT median 16ms nghĩa là decode đang ở vùng rất tốt so với floor 20ms
+của scoring. Đây là lý do v26/v31 thắng v28 dù v28 pass 120/120 SLO TTFT: v28 TBT 35ms
+bị phạt nặng hơn.
+
+| Component | Cờ tác động | Quan sát từ submit | Tối ưu đúng cho v26/v31 |
+|---|---|---|---|
+| Scheduler tick/wait | `--max-num-seqs`, `--async-scheduling` | `seqs=10` -> TBT 15-16; `seqs=20` -> 21-22; default 128 -> 35 | Giữ `--max-num-seqs=10`. Đây là cờ quan trọng nhất cho TPOT/score. |
+| Decode batch size | `--max-num-seqs`, active concurrent requests | Tăng concurrency làm TTFT đẹp nhưng TPOT xấu | Không tối ưu theo pass SLO; tối ưu theo ERS 50/50. |
+| CUDAGraph/dispatch | cudagraph capture sizes, compile config, async scheduling | Với `seqs=10`, default capture size runtime thường đủ nhỏ | Chỉ set thủ công nếu log thấy graph miss; không thêm cờ compile bừa. |
+| Attention KV read | `--kv-cache-dtype=fp8`, `--block-size`, prefix cache | FP8 KV giúp decode bandwidth nhưng ép block size lớn/align Mamba | Giữ FP8 KV trong v31; nếu A/B BF16 KV thì phải retune `max-num-batched-tokens`. |
+| GDN/Mamba update | `--mamba-cache-dtype`, `--mamba-cache-mode` | `mamba-cache-dtype=bf16` từng giảm TBT 1ms nhưng xấu TTFT/net loss; `all` không hợp Qwen3.5 v0.24 | Không set `mamba-cache-mode=all`; không ưu tiên mamba dtype trừ khi sweep lại trên v0.24. |
+| Sampler/output | sampling params, logprobs, guided decoding, logging | Nếu benchmark không cần logprobs/structured output thì nên tránh | Không bật guided/speculative/logprobs. Thêm no-log request là low-risk. |
+| Detokenize/flush | streaming interval, tokenizer CPU | Ít hơn kernel/decode batch, nhưng nằm trong residual | Có thể thử `--stream-interval` nếu harness chấp nhận; đừng làm tăng first-token flush. |
+
+### -1.3 Compose v26/v31 hiện tại: giữ gì, thử gì, tránh gì
+
+V26 hiện tại:
+
+```yaml
+image: vllm/vllm-openai:v0.24.0
+--max-model-len=48000
+--gpu-memory-utilization=0.95
+--tensor-parallel-size=1
+--enable-prefix-caching
+--language-model-only
+--kv-cache-dtype=fp8
+--calculate-kv-scales
+--max-num-seqs=10
+--quantization=fp8
+--gdn-prefill-backend=flashinfer
+--max-num-batched-tokens=2174
+```
+
+V31 = v26 hygiene-only:
+
+```yaml
+--no-enable-log-requests
+--disable-log-stats
+# bỏ --calculate-kv-scales
+```
+
+Kết quả submit: **v31 = 53.20**, v26 = 53.12. Chênh +0.08 nằm trong nhiễu, nhưng
+nó xác nhận đúng hai điều: logging overhead không đáng kể ở regime `seqs=10`, và
+`--calculate-kv-scales` thật sự không có tác dụng thực tế trên path hybrid GDN/Mamba
+này.
+
+**Giữ chắc:**
+
+- `image: vllm/vllm-openai:v0.24.0`: v28/v29/v30 chứng minh 0.24 thắng 0.22 rõ rệt.
+- `--max-num-seqs=10`: cờ quyết định TBT/score. v27 `seqs=20` và v28 default 128 đều thua dù TTFT đẹp hơn.
+- `--max-num-batched-tokens=2174`: đủ vượt 2 block Mamba/FP8 KV (`2144`) với headroom nhỏ; đây là sweet spot v26/v31.
+- `--gdn-prefill-backend=flashinfer`: backend GDN tốt nhất đã đo; v0.24 dùng FlashInfer mới hơn.
+- `--quantization=fp8`: weight FP8 là đòn prefill/GEMM lớn.
+- `--kv-cache-dtype=fp8`: không chỉ tiết kiệm KV, mà còn đang là một phần của regime block-size 1072; bỏ nó là đổi bài toán scheduler.
+- `--enable-prefix-caching`: cần cho round sau; không phải cứu round 1 nhưng vẫn giữ.
+- `--language-model-only`: tránh vision tower/runtime thừa.
+
+**Đã đo và có thể giữ như v31:**
+
+- Thêm `--no-enable-log-requests`: neutral/tốt nhẹ; không đổi scheduling/kernel.
+- Thêm `--disable-log-stats`: neutral/tốt nhẹ khi giữ `seqs=10`; v27 regression là do `seqs=20`, không phải do cờ này.
+- Bỏ `--calculate-kv-scales`: confirmed inert; v31 giữ TBT 16 và accuracy_drop 0.
+
+**Có thể cải tiến/A-B sâu tiếp quanh v31:**
+
+- `v32`: thêm `--default-chat-template-kwargs={"enable_thinking": false}`. Đây không phải scheduler knob; nó đi qua OpenAI chat serving -> `_effective_chat_template_kwargs` -> tokenizer/render. V28 có flag này nhưng bị nhiễu bởi default `seqs=128`, nên chưa cô lập được.
+- `v33`: `--max-model-len=32768`. V28 chứng minh workload không reject ở 32k; nếu 48k là headroom thừa, 32k có thể giảm profile/cache pressure. Kỳ vọng nhỏ vì v31 không memory-bound.
+- `v34`: `--async-scheduling`. Đây đổi class `Scheduler` -> `AsyncScheduler`, không chỉ đổi logging. Cửa thắng duy nhất là TBT 16->15; nếu TTFT tail/accuracy xấu thì bỏ.
+- Micro-sweep `--max-num-batched-tokens` với `seqs=10`: `2174`, `2208`, `2304`, `3216`. Dự đoán `2174/2208` là vùng đáng thử; `2144` không nên ưu tiên vì chỉ cần decode token chen vào là budget còn dưới 2144 và chunk rơi về 1 block.
+
+**Tránh cho v26/v31:**
+
+- Không tăng `--max-num-seqs` lên 20/128 chỉ để đẹp TTFT. Bảng điểm đã chứng minh score giảm.
+- Không set `--mamba-cache-mode=all`: Qwen3.5 v0.24 có guard không support; hơn nữa mode này có thể kéo attention block size theo alignment Mamba.
+- Không bật speculative/MTP: v8 từng regression nặng; hybrid GDN/Mamba + scorer hiện tại không đáng rủi ro.
+- Không bật partial prefill/concurrent partial prefill hoặc `--long-prefill-token-threshold=256`: các thử nghiệm v15/v19 crash/không hợp Mamba block alignment.
+- Không đổi `--gdn-prefill-backend` sang triton/cutedsl: đã đo kém hơn hoặc có accuracy drop.
+
+**Dead-end sâu sau khi trace code:**
+
+- `--max-cudagraph-capture-size` / `--cudagraph-capture-sizes`: với `max-num-seqs=10`, vLLM tự set max graph size `min(max_num_seqs*2,512)=20`, đủ phủ decode batch <=10. Thêm thủ công khó giảm TBT hơn nữa, có thể chỉ tăng warmup/capture memory.
+- `--stream-interval > 1`: output processor vẫn gửi token đầu, nhưng các token sau bị buffer tới interval. Nếu scorer đo streaming TBT theo client receive time, cờ này làm TBT nhìn xấu dù host overhead giảm.
+- `--watermark`: chỉ áp vào waiting/preempted requests khi đã có scheduled reqs. v31 không có preemption/failed, nên watermark chủ yếu làm admission khó hơn -> TTFT xấu.
+- `--prefill-schedule-interval`: code comment ghi cho data-parallel prefill balancing. Single GPU/TP=1 không phải chỗ thắng.
+- `--scheduling-policy=priority`: nếu request không gửi priority khác 0 thì không đổi bản chất FCFS; chỉ thêm cơ chế preempt theo priority khi thiếu KV.
+- Concurrent partial prefill: v0.24 vẫn có path, nhưng default threshold khi bật là `0.04*max_model_len=1920`, dưới 2 block 2144 của regime FP8-KV/Mamba. Muốn thử phải block-aware, nhưng rủi ro là thêm prefill chunks vào running set và làm TBT rời vùng 16ms.
+
+### -1.4 Thứ tự tối ưu thực tế tiếp theo
+
+Đã tạo v32/v33/v34 để submit theo thứ tự này, mỗi file đổi đúng một biến so với
+v31:
+
+1. **v32 chat-template A/B**: v31 + `enable_thinking=false`, vì đây là nhánh preprocess chưa được cô lập.
+2. **v33 max-len A/B**: v31 + `max-model-len=32768`, vì v28 cho thấy có vẻ không reject workload.
+3. **v34 async-only A/B**: v31 + `--async-scheduling`, chỉ giữ nếu TBT giảm mà accuracy không rơi.
+4. **batch micro-sweep**: giữ nguyên v31, chỉ đổi `--max-num-batched-tokens` quanh `2174/2208/2304`.
+
+Mục tiêu không phải làm TTFT đẹp nhất, mà là giữ điểm tổng: **TBT không được rời
+vùng 15-16ms**; mọi cải tiến TTFT chỉ đáng nhận nếu không làm TBT tăng hoặc accuracy
+drop xuất hiện.
+
+Nếu được phép build custom vLLM image, frontier thật sự không còn là flag mà là
+patch scheduler: giữ decode lane ở regime `seqs≈10`, nhưng cho prefill chen theo
+quota block-aware khi `token_budget_after_decode >= 2144`. Nói cách khác, thay vì
+một `token_budget` chung đang ép trade-off cứng TTFT-vs-TBT, tạo policy hai làn:
+decode luôn được bảo vệ để TBT không vượt 16ms, còn prefill chỉ chạy ở chunk đúng
+2 block Mamba/FP8-KV. Đây mới là hướng có khả năng giảm TTFT mà không trả giá TBT;
+các flag public hiện tại không biểu diễn được policy này đủ mịn.
 
 ## 0. Sự thật phần cứng về model (đọc từ config.json)
 
