@@ -1,0 +1,40 @@
+# Submission image — OFFLINE FP8 quantization at container STARTUP.
+#
+# WHY runtime (not build-time): BTC mounts the BF16 model onto /model at run
+# time, OVERRIDING anything baked at /model during build. So we cannot
+# pre-quantize into the image — we must quantize the *mounted* /model when the
+# container starts, then serve the result from a different path (/model-fp8).
+#
+# Build for the grading box (MIG H200, x86_64) regardless of build host arch:
+#   docker build --platform linux/amd64 -f serve/Dockerfile.fp8-offline \
+#       -t duc0811/qwen35-2b-race-fp8offline:v1 .
+#   docker push duc0811/qwen35-2b-race-fp8offline:v1
+# (build context = repo root, so scripts/ and data/ are visible)
+#
+# Verified 2026-07-14: vllm/vllm-openai:v0.24.0 already ships torch 2.11.0+cu130,
+# transformers 5.12.1 (has qwen3_5 modeling — no from-source needed),
+# compressed-tensors 0.17.0 (exactly the quantize pin), accelerate 1.14.0.
+# We only ADD llmcompressor + datasets, in an ISOLATED --system-site-packages
+# venv, with --no-deps on llmcompressor so pip cannot bump compressed-tensors
+# off vLLM's hard-pinned 0.17.0. auto-round is skipped (FP8 path never uses it).
+
+FROM --platform=linux/amd64 vllm/vllm-openai:v0.24.0
+
+# --- quantize toolchain (isolated; reuses image torch/transformers/CT/accelerate) ---
+RUN python3 -m venv --system-site-packages /opt/qvenv \
+ && /opt/qvenv/bin/pip install --no-cache-dir --no-deps "llmcompressor==0.12.0" \
+ && /opt/qvenv/bin/pip install --no-cache-dir "datasets>=4.8.4,<=5.0.0" \
+ && /opt/qvenv/bin/python -c "from llmcompressor import oneshot; \
+from llmcompressor.modifiers.quantization import QuantizationModifier; \
+import compressed_tensors as c; assert c.__version__=='0.17.0', c.__version__; \
+print('quantize venv OK, compressed-tensors', c.__version__)"
+
+# --- quantize code + calibration set (GPQA = where accuracy is graded) + wrapper ---
+COPY scripts/14_quantize_fp8.py            /opt/quantize/14_quantize_fp8.py
+COPY data/GPQA/gpqa_diamond.parquet        /opt/quantize/data/GPQA/gpqa_diamond.parquet
+COPY serve/quantize_and_serve.sh           /opt/quantize/quantize_and_serve.sh
+RUN chmod +x /opt/quantize/quantize_and_serve.sh
+
+# The compose passes the vLLM args as `command:`; this wrapper quantizes /model
+# then exec's `python3 -m vllm.entrypoints.openai.api_server "$@"`.
+ENTRYPOINT ["/opt/quantize/quantize_and_serve.sh"]

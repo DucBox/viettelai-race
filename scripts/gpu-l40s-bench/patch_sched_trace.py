@@ -29,9 +29,11 @@ if _t_os.environ.get("SCHED_TRACE"):
     _t_orig = Scheduler.schedule
     _t_f = open(_t_os.environ["SCHED_TRACE"], "w")
     _t_last = [None]
-    def _t_schedule(self):
+    def _t_schedule(self, *_a_args, **_k_args):
+        # 0.24: schedule(self, throttle_prefills=False) -> phai forward arg,
+        # nếu không TypeError vỡ scheduler (core.py goi schedule(throttle) moi step)
         _a = _t_time.monotonic()
-        out = _t_orig(self)
+        out = _t_orig(self, *_a_args, **_k_args)
         _b = _t_time.monotonic()
         try:
             nst = getattr(out, "total_num_scheduled_tokens", None)

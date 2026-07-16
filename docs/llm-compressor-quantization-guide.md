@@ -4,7 +4,7 @@ Tài liệu tham chiếu cho bước **quantize model** (tách khỏi tối ưu 
 `docs/vllm-optimization-guide.md`). Gồm 2 phần: (A) tóm tắt quy trình 5 bước
 chính thức của llm-compressor áp luôn vào case của mình, (B) rủi ro
 version/dependency đã điều tra thật (không phải suy đoán) giữa llm-compressor
-↔ compressed-tensors ↔ vLLM v0.22.1.
+↔ compressed-tensors ↔ `vendor/vllm-0.24.0`.
 
 ---
 
@@ -133,34 +133,61 @@ ignore=["lm_head", "re:.*mlp.gate$", "re:.*mlp.shared_expert_gate$", "re:.*linea
 `vllm-optimization-guide.md` §4b đang ghi. **→ §4b cần cập nhật lại theo hướng
 này** (chưa sửa, ghi nhận ở đây trước).
 
-### Version pin — không có tổ hợp nào được test chính thức khớp compressed-tensors 0.15.x
+### Version pin — `vendor/vllm-0.24.0` khóa `compressed-tensors==0.17.0`
 
-vLLM v0.22.1 pin cứng `compressed-tensors==0.15.0.1` (từ PyPI JSON thật).
-Nhưng lịch sử pin của llm-compressor **nhảy qua** dải 0.15.x:
+Trong source vendor hiện tại, vLLM pin cứng:
+
+- `vendor/vllm-0.24.0/requirements/common.txt` → `compressed-tensors == 0.17.0`
+- `vendor/vllm-0.24.0/requirements/test/rocm.txt` → `compressed-tensors==0.17.0`
+
+Trong khi đó các bản `llmcompressor` public gần nhất pin như sau:
 
 | llm-compressor | compressed-tensors pin | Ngày release |
 |---|---|---|
-| 0.9.0 / 0.9.0.3 | `==0.13.0` | |
-| 0.10.0 | `==0.14.0` | 2026-02-27 (ct) |
-| 0.10.0.2 | `==0.14.0.1` | 2026-05-01 (**sau khi 0.15.0.1 đã tồn tại 3 tuần, nhưng KHÔNG bump lên**) |
-| **0.10.1a20260407** (alpha) | `>=0.14.1a2` (mở, không chặn trên) | 2026-04-08 — **duy nhất tự nhiên chấp nhận 0.15.0.1** |
+| **0.10.1a20260407** (alpha) | `>=0.14.1a2` (mở, không chặn trên) | 2026-04-08 |
 | 0.11.0 | `==0.16.0` | 2026-06-02 |
 | 0.12.0 (stable mới nhất) | `==0.17.1` | 2026-06-15 |
 
-torch/transformers giữa llm-compressor 0.12.0 và vLLM v0.22.1 thực ra **khớp
-nhau** (torch 2.11.0 nằm trong `2.10.0–2.12.0`; transformers 5.9.0–5.10.1
-không rơi vào vùng vLLM loại trừ 5.0–5.5.0) — **chỉ `compressed-tensors` là
-điểm xung đột thật**, và đúng dải version vLLM cần chưa từng được
-llm-compressor test chính thức.
+Kết luận quan trọng:
 
-### Lệnh pip đề xuất thử trước (chạy trên GPU pod, Python ≥3.10)
+1. **Không có bản `llmcompressor` public nào pin đúng `compressed-tensors==0.17.0`.**
+2. Nếu cài `pip install llmcompressor` chung env với `vendor/vllm-0.24.0`,
+   pip sẽ muốn kéo `compressed-tensors==0.17.1` (với `llmcompressor 0.12.0`)
+   và lệch khỏi pin của vLLM.
+3. Đây đúng là lý do tài liệu chính thức của vLLM ở nhánh
+   `docs/features/quantization/llm_compressor/*.md` đều nhắc:
+   **"Please use separate environments for vLLM and llm-compressor as they
+   might not work together."**
+
+Nói ngắn gọn: với `vLLM 0.24.0`, **xung đột thật nằm ở `compressed-tensors`**.
+`torch/transformers` có thể còn thương lượng được, nhưng `compressed-tensors`
+là package vLLM pin cứng nên không nên để pip tự nâng/hạ.
+
+### Khuyến nghị cài đặt
+
+**Khuyến nghị mạnh nhất:** tách 2 env
+
+- **Env quantize**: cài `llmcompressor` theo bản nó cần, chạy `scripts/14_quantize_fp8.py`
+- **Env serve**: giữ nguyên pin của `vendor/vllm-0.24.0`, đặc biệt
+  `compressed-tensors==0.17.0`
+
+Lý do cách này an toàn nhất: quantization chỉ cần xuất checkpoint
+`compressed-tensors`; lúc serve, vLLM chỉ cần đọc artifact đã lưu, không cần
+import `llmcompressor`.
+
+**Nếu buộc phải cài chung một env** thì đây chỉ là phương án "gần nhất", không
+phải tổ hợp được upstream test chính thức:
 
 ```bash
 python3.11 -m venv .venv-quantize && source .venv-quantize/bin/activate
 
-pip install --pre "llmcompressor==0.10.1a20260407" "compressed-tensors==0.15.0.1"
+pip install "compressed-tensors==0.17.0"
+pip install --no-deps "llmcompressor==0.12.0"
 
-pip install "https://github.com/huggingface/transformers/archive/refs/heads/main.zip" accelerate
+pip install accelerate
+
+# Chỉ cài transformers-from-source nếu model class stable chưa đủ
+pip install "https://github.com/huggingface/transformers/archive/refs/heads/main.zip"
 
 python -c "
 import torch, transformers, compressed_tensors, llmcompressor
@@ -172,8 +199,8 @@ print('imports OK')
 "
 ```
 
-Nếu bước cuối lỗi import → fallback thử ép `llmcompressor==0.11.0 --no-deps`
-rồi `pip install "compressed-tensors==0.15.0.1"` đè lên.
+Nếu import hỏng hoặc runtime lỗi ở nhánh này, **đừng cố vá thêm trong cùng
+env**; quay lại phương án tách env sẽ sạch hơn nhiều.
 
 **Bằng chứng cộng đồng cũng gặp đúng lỗi kiểu này (không phải lo xa):**
 [llm-compressor#2258](https://github.com/vllm-project/llm-compressor/issues/2258)
@@ -187,13 +214,14 @@ vLLM cụ thể, không portable — câu hỏi bị đóng "not planned", chưa
 
 ## Việc chưa làm / bước tiếp theo
 
-1. Chạy lệnh pip ở mục B trên GPU pod thật, xác nhận import OK + đúng version.
+1. Chạy lệnh import-check ở mục B trên GPU pod thật, xác nhận `llmcompressor`
+   có sống được với `compressed-tensors==0.17.0` hay không.
 2. Cập nhật `vllm-optimization-guide.md` §4b: đổi ignore-list sang loại cả
    `re:.*linear_attn.*` (theo tiền lệ Qwen3-Next), không chỉ giữ 2 gate nhỏ.
 3. Viết `scripts/12_quantize_fp8.py`: load bằng `AutoModelForImageTextToText`,
    recipe `FP8_DYNAMIC` + ignore-list mới, **bắt buộc có bước sanity-generate**
    trước khi save (xem mục A.5) — đừng bỏ qua bước này.
-4. Load checkpoint FP8 thật trên đúng image `vllm/vllm-openai:v0.22.1`, verify
+4. Load checkpoint FP8 thật trên đúng image `vllm/vllm-openai:v0.24.0`, verify
    không lỗi parse/import.
 5. Chạy `09_gpqa_accuracy.py` so sánh với baseline BF16, giữ margin ≥5 điểm so
    ngưỡng 0.30. Nếu tụt sát ngưỡng → cân nhắc lever dự phòng ở mục A.4
@@ -206,5 +234,7 @@ vLLM cụ thể, không portable — câu hỏi bị đóng "not planned", chưa
 [Qwen3-Next FP8 example](https://github.com/vllm-project/llm-compressor/blob/main/examples/quantization_w8a8_fp8/qwen3_next_example.py) ·
 [llm-compressor#2258](https://github.com/vllm-project/llm-compressor/issues/2258) ·
 [llm-compressor#2268](https://github.com/vllm-project/llm-compressor/issues/2268) ·
-[PyPI vllm 0.22.1 JSON](https://pypi.org/pypi/vllm/0.22.1/json) ·
+[PyPI llmcompressor 0.10.1a20260407 JSON](https://pypi.org/pypi/llmcompressor/0.10.1a20260407/json) ·
+[PyPI llmcompressor 0.11.0 JSON](https://pypi.org/pypi/llmcompressor/0.11.0/json) ·
+[PyPI llmcompressor 0.12.0 JSON](https://pypi.org/pypi/llmcompressor/0.12.0/json) ·
 [PyPI llmcompressor JSON](https://pypi.org/pypi/llmcompressor/json)

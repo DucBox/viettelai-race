@@ -8,17 +8,14 @@ Place each model as a flat HuggingFace-format directory here:
 
 ```
 serve/models/
-  qwen3.5-2b/
+  lfm2.5-1.2b/
     config.json
     tokenizer.json
     tokenizer_config.json
-    model.safetensors.index.json
-    model.safetensors-00001-of-00001.safetensors   # (or however many shards the index lists)
-    vocab.json                (optional but expected)
-    merges.txt                (optional but expected)
+    model.safetensors            # LFM2.5-1.2B is a single-shard checkpoint (~2.2 GB, no index)
+    special_tokens_map.json   (optional but expected)
     chat_template.jinja       (optional but expected)
-    preprocessor_config.json  (optional — multimodal)
-    video_preprocessor_config.json (optional — multimodal)
+    generation_config.json    (optional but expected)
     LICENSE / README.md       (optional, informational)
 ```
 
@@ -35,11 +32,13 @@ However you obtain the weights (this project doesn't do it), get them into
 `serve/models/<name>/` before serving, e.g.:
 
 ```bash
-# from a machine that already has them cached (HF cache -> flat dir):
-cp -RL ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/*/ serve/models/qwen3.5-2b/
+# simplest — download straight from HuggingFace (public, not gated):
+hf download LiquidAI/LFM2.5-1.2B-Instruct --local-dir serve/models/lfm2.5-1.2b
+#   (no `hf` CLI? python -c "from huggingface_hub import snapshot_download; \
+#    snapshot_download('LiquidAI/LFM2.5-1.2B-Instruct', local_dir='serve/models/lfm2.5-1.2b')")
 
 # or scp/rsync from wherever they live:
-rsync -avP other-host:/path/to/qwen3.5-2b/ serve/models/qwen3.5-2b/
+rsync -avP other-host:/path/to/lfm2.5-1.2b/ serve/models/lfm2.5-1.2b/
 ```
 
 Then verify:
@@ -50,7 +49,7 @@ Then verify:
 
 ## Using a different model directory name, or a different image
 
-Nothing here is hardcoded to `qwen3.5-2b` — both the model path and the vLLM
+Nothing here is hardcoded to `lfm2.5-1.2b` — both the model path and the vLLM
 image are just values in `serve/.env` (copy `serve/.env.example` first):
 
 ```bash
@@ -62,7 +61,7 @@ MODEL_PATH=/models/my-other-model     # path INSIDE the container — keep these
 SERVED_MODEL_NAME=my-other-model      # name clients (AIPerf, curl) will request
 
 # If you're using an image from your own registry instead of Docker Hub:
-IMAGE=registry.internal.example.com/team/vllm-openai:v0.22.1
+IMAGE=registry.internal.example.com/team/vllm-openai:<lfm2-capable-tag>
 ```
 
 `docker-compose.yml` reads all four from `.env` — no edits to the compose file

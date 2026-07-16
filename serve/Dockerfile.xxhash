@@ -1,0 +1,20 @@
+# Submission image — vllm/vllm-openai:v0.24.0 + goi `xxhash` (image goc THIEU).
+#
+# WHY: --prefix-caching-hash-algo=xxhash can package xxhash (co xxh3_128_digest),
+# nhung image goc chi co xxhash trong requirements/test -> KHONG cai runtime.
+# Thieu -> container crash o block hash dau tien. Image nay pip san xxhash.
+#
+# KHONG can GPU luc build (chi pip install). Entrypoint van de compose override
+# (python3 -m vllm.entrypoints.openai.api_server) nhu cac submit khac.
+#
+# Build cho grading box (MIG H200, x86_64) bat ke arch may build:
+#   docker build --platform linux/amd64 -f serve/Dockerfile.xxhash \
+#       -t duc0811/qwen35-2b-race-xxhash:v1 .
+#   docker push duc0811/qwen35-2b-race-xxhash:v1
+# Roi trong compose: image: duc0811/qwen35-2b-race-xxhash:v1
+#                    + them co --prefix-caching-hash-algo=xxhash
+
+FROM --platform=linux/amd64 vllm/vllm-openai:v0.24.0
+
+RUN pip install --no-cache-dir "xxhash>=3.5.0" \
+ && python3 -c "import xxhash; assert hasattr(xxhash, 'xxh3_128_digest'), 'thieu xxh3_128_digest'; import vllm.utils.hashing as h; assert h._xxhash is not None, 'vLLM khong nhan xxhash'; print('xxhash OK', xxhash.VERSION)"

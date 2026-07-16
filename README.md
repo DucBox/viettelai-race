@@ -1,22 +1,24 @@
 # Viettel AI Race 2026 — Track 3 · Baseline / Flow-Verify Kit
 
-Serve **Qwen/Qwen3.5-2B** on vLLM, fire test traffic, and view every metric that
-matters — **before** touching the production server or any optimization.
+Serve **LiquidAI/LFM2.5-1.2B-Instruct** on vLLM, fire test traffic, and view every
+metric that matters — **before** touching the production server or any optimization.
 
-📐 **[Architecture deep-dive (bilingual VI/EN, live page)](https://claude.ai/code/artifact/72530e47-ea0e-4cae-8e43-e1ea9595f46f)**
-— Gated DeltaNet vs. full attention, layer by layer, and how each property
-drives caching/quantization/serving. Source: `docs/qwen35-architecture.html`.
+> ℹ️ **Ruleset changed 2026-07-16.** The competition model is now
+> **LFM2.5-1.2B-Instruct** (was Qwen3.5-2B). LFM2.5 is a hybrid *short-range
+> convolution + GQA attention* model (16 layers = 10 conv + 6 attention, 1.17B,
+> text-only). Everything about the old Qwen setup (docs under `docs/vllm-v0.22.1*`,
+> `docs/vllm-v0.24.0*`, `scripts/gpu-l40s-bench/`) is kept only as **reference**.
 
 > ⚠️ **Runs on a Linux + NVIDIA GPU box only.** This kit does not work on macOS /
-> Apple Silicon: vLLM needs CUDA, and Qwen3.5-2B is a hybrid *Gated DeltaNet +
-> attention* model whose kernels are CUDA-only. Use a small dev GPU for this step
-> (the doc mentions an RTX 3060; a cloud L4 / A10 also works). Everything here is
-> pre-written so you just copy the folder to the GPU box and run.
+> Apple Silicon: vLLM needs CUDA. Use a dev GPU for this step (a cloud L4 / A10 /
+> L40S works). Everything here is pre-written so you just copy the folder to the
+> GPU box and run.
 
-> 📦 **This repo does not download models.** Weights are assumed to already be
-> on disk at `serve/models/qwen3.5-2b/` — `scripts/01_check_model.sh` only
-> *verifies* the directory is complete and reports exactly what's missing. See
-> `serve/models/README.md` for the expected layout.
+> 📦 **This repo does not download models by default.** Weights are assumed to be
+> on disk at `serve/models/lfm2.5-1.2b/` — `scripts/01_check_model.sh` only
+> *verifies* the directory is complete and reports what's missing. Grab them with
+> `hf download LiquidAI/LFM2.5-1.2B-Instruct --local-dir serve/models/lfm2.5-1.2b`.
+> See `serve/models/README.md` for the expected layout.
 
 ## The goal of this step
 
@@ -42,7 +44,7 @@ serve/
   .env.example         copy to .env and edit
   models/
     README.md          expected model directory layout
-    qwen3.5-2b/         <- put the weights here yourself (gitignored, not fetched by this repo)
+    lfm2.5-1.2b/        <- put the weights here yourself (gitignored, not fetched by this repo)
 scripts/
   00_list_gpus.sh      optional: list host GPUs if the default card (0) is busy
   01_check_model.sh    verify serve/models/<name>/ is complete; reports missing files, doesn't fetch
@@ -64,7 +66,7 @@ aiperf/
   vendored clone of github.com/ai-dynamo/aiperf — source + docs reference (gitignored)
 docs/
   VIETTEL AI RACE.pdf              the problem statement
-  qwen35-architecture.html        bilingual architecture deep-dive (live: https://claude.ai/code/artifact/72530e47-ea0e-4cae-8e43-e1ea9595f46f)
+  qwen35-architecture.html        (REFERENCE, old Qwen model) architecture deep-dive
   trace-round1-data-description.md  schema + structure of the trace files
 ```
 
@@ -74,14 +76,14 @@ One runbook, two contexts — only the `.env` values differ:
 
 | | Small dev GPU (RTX 3060 / L4 / A10) | Internal multi-GPU server |
 |---|---|---|
-| `IMAGE` | default (Docker Hub `vllm/vllm-openai:v0.22.1`) | your internal registry path |
+| `IMAGE` | default (Docker Hub `vllm/vllm-openai:latest`, must support `lfm2`) | your internal registry path |
 | `GPU_ID` | default `0` (only card) | default `0` — override only if card 0 is busy (`./scripts/00_list_gpus.sh`) |
-| `MAX_MODEL_LEN` | `32768` (fits a small card) | same, unless the card has more headroom |
+| `MAX_MODEL_LEN` | `8192` (trace ~4k in + 200 out) | same, unless the card has more headroom |
 
 ### 0. Prereqs
 - NVIDIA driver + `nvidia-container-toolkit` (check: `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi`)
 - `docker` + `docker compose`
-- Model weights already placed at `serve/models/qwen3.5-2b/` (this repo never downloads them — see `serve/models/README.md`)
+- Model weights already placed at `serve/models/lfm2.5-1.2b/` (see `serve/models/README.md` for the one-line `hf download`)
 
 ### 1. Configure
 ```bash
@@ -94,7 +96,7 @@ cd ..
 ```bash
 ./scripts/serve_up.sh
 ```
-One command: verifies `serve/models/qwen3.5-2b/` is complete (fails fast with an
+One command: verifies `serve/models/lfm2.5-1.2b/` is complete (fails fast with an
 exact missing-file list if not), brings the container up pinned to `GPU_ID`, and
 polls `/health` until vLLM is actually ready (first boot includes model load +
 CUDA graph compile — can take a few minutes).
@@ -158,12 +160,12 @@ usage), and the nearest KV-cache / prefix scrape. It also dumps a full
 
 ## Config vs. the BTC baseline
 
-| Setting              | This test kit           | BTC scoring baseline        |
+| Setting              | This test kit           | BTC scoring env              |
 |----------------------|-------------------------|-----------------------------|
-| image                | `vllm/vllm-openai:v0.22.1` | `vllm/vllm-openai:v0.22.1` |
+| image                | `vllm/vllm-openai:latest` (must support `lfm2`) | your submitted image on MIG H200 |
 | model source         | local dir, offline      | weights baked into image     |
-| `max-model-len`      | 32768 (fits small GPU)  | 262144                      |
-| `gpu-memory-util`    | 0.90                    | 0.95                        |
+| `max-model-len`      | 8192 (trace ~4k in + 200 out) | set to fit workload    |
+| `gpu-memory-util`    | 0.90                    | 0.95 (on 18 GiB MIG slice)  |
 | `enable-prefix-caching` | on                   | on                          |
 
 Keep this local kit deliberately modest — its job is to confirm the pipeline and

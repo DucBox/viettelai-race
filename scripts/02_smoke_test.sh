@@ -15,7 +15,7 @@ if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
 eval "$_pre_env_declare"
 
 URL="${URL:-http://localhost:8000}"
-MODEL="${SERVED_MODEL_NAME:-qwen3.5-2b}"
+MODEL="${SERVED_MODEL_NAME:-lfm2.5-1.2b}"
 
 echo ">> Health check: $URL/health"
 curl -fsS "$URL/health" && echo "  OK" || { echo "  server not healthy"; exit 1; }

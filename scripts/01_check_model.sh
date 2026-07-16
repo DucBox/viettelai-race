@@ -3,7 +3,7 @@
 # Model weights must already be placed at serve/models/<name>/ (e.g. via scp,
 # rsync, or a manual `hf download` done elsewhere). This script only checks.
 #
-#   ./scripts/01_check_model.sh                       # checks serve/models/qwen3.5-2b
+#   ./scripts/01_check_model.sh                       # checks serve/models/lfm2.5-1.2b
 #   MODEL_DIR=serve/models/other ./scripts/01_check_model.sh
 #
 # Exit code 0 = complete, 1 = missing files (lists exactly what's missing).
@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 _pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
 eval "$_pre_env_declare"
-MODEL_DIR="${MODEL_DIR:-serve/models/qwen3.5-2b}"
+MODEL_DIR="${MODEL_DIR:-serve/models/lfm2.5-1.2b}"
 # .env's MODEL_DIR is relative to serve/ (docker-compose context) — normalize
 # so this script works whether it's given as "./models/x", "serve/models/x",
 # or an absolute path (left untouched).
@@ -71,7 +71,9 @@ fi
 
 # Soft requirements: nice to have (chat formatting, multimodal preprocessing),
 # but their absence doesn't block a text-only vLLM serve.
-optional=(vocab.json merges.txt chat_template.jinja preprocessor_config.json video_preprocessor_config.json LICENSE)
+# LFM2.5 is text-only (no multimodal preprocessor); tokenizer.json is self-contained
+# (no separate vocab.json/merges.txt). These are the nice-to-haves for chat + sampling.
+optional=(chat_template.jinja generation_config.json special_tokens_map.json LICENSE)
 for f in "${optional[@]}"; do
   [[ -s "$MODEL_DIR/$f" ]] || warn+=("$f")
 done

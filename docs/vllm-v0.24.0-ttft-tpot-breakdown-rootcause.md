@@ -139,6 +139,83 @@ TPOT: `gen = 101`, `decode_time = 2000 ms` ⇒ `TPOT = 2000 / (101−1) = 20.0 m
 
 ---
 
+## 0.3 Workload-specific action matrix — 20 users × 6 turns, không dừng ở public flags
+
+Trace thật đã xác nhận:
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Request | 120 = **20 session × 6 round** |
+| Burst | mỗi round 20 request trong **475ms**, IAT nội bộ **25ms** |
+| Round start | 0, 5000, 10000, 15000, 20000, 25000ms |
+| Think time giữa burst | 4525ms |
+| Message count | 2, 4, 6, 8, 10, 12 |
+| Token thật theo round | 12,949 → 15,835 → 18,720 → 21,603 → 24,488 → 27,373 |
+| Max prompt+output | ~27,600 token, nên `max_model_len=32768` vẫn đủ |
+| Shared prefix | system prompt chung `1/1`, prefix continuity `100/100` cặp session |
+
+Điều này đổi cách tối ưu:
+
+- Round 1 có **20 prompt ~13k token cùng chung system prefix** lao vào gần đồng thời. Prefix cache mặc định chỉ giúp sau khi có block đã cache; nếu 20 request cùng hỏi cache trước khi request đầu hoàn tất, phần system có thể bị tính lặp. Đây là vùng **code-level** đáng tiền nhất.
+- Round 2-6 đến mỗi 5s, nhưng v31 TTFT p50 ~9.3s nghĩa là burst sau có thể đến khi burst trước chưa ra token đầu. Prefix/cache lợi ích bị giới hạn bởi overlap thời gian.
+- TPOT v31 = 16ms, dưới floor 20ms. Có **4ms slack** để mua lại TTFT/Queue, miễn không vượt 20ms hoặc accuracy drop.
+
+### 0.3.1 Residual_in: HTTP/chat-template/tokenize/ZMQ
+
+| Leaf | Tình trạng trên trace | Flag-level | Client / workload trick | Code-mod thật sự |
+|---|---|---|---|---|
+| A1 chat-template render | 120 request đều là chat; mỗi request render lại toàn bộ lịch sử 13k→27k token | `--default-chat-template-kwargs={"enable_thinking": false}` nếu template Qwen dùng biến này; v32 đã cô lập | Nếu kiểm soát client, render chat template offline 1 lần/request, gửi sang `/v1/completions` thay vì `/chat/completions` | Thêm cache render theo hash `messages` trong OpenAI frontend; key là JSON messages + template kwargs |
+| A1 tokenize | HF tokenizer CPU, cost tăng theo prompt length; round 6 ~27k token | `--renderer-num-workers` có thể giúp nếu frontend CPU-bound, nhưng phải đo vì thêm worker cũng thêm IPC/coordination | `/v1/completions` chấp nhận `prompt: list[int]`; gửi token ids để bỏ tokenizer. Không set `--skip-tokenizer-init` nếu vẫn cần detokenize text output | Patch `/v1/chat/completions` nhận thêm `prompt_token_ids` hoặc internal header để bypass tokenizer sau khi client/proxy đã tokenize |
+| A2 validate | Nhỏ so với tokenize/prefill | Không đáng | Không đáng | Không đáng |
+| A3 ZMQ/msgpack frontend→core | Text/token list copy qua process boundary | Không có cờ ngon | Token ids làm payload số nguyên lớn; text 14MB trace cũng không phải bottleneck chính | Muốn triệt để: single-process engine hoặc shared-memory request payload, nhưng rủi ro lớn |
+| A4 engine input HOL | Engine busy-loop đọc input queue giữa các step; step prefill dài làm request mới chờ | Giảm step quá tay sẽ hại prefill throughput | Điều phối client không bắn 20 request vào cùng 475ms nếu luật cho phép; thường không được | Patch scheduler/engine để drain input queue cả trong lúc GPU step đang chạy hoặc tách input receiver thread đẩy thẳng vào waiting queue |
+
+**Kết luận Residual_in:** nếu benchmark bắt buộc OpenAI chat API, cờ chỉ còn v32 và logging hygiene. Đòn thật là **pre-tokenized completions** hoặc patch chat endpoint nhận token ids/cache render. Đây không làm GPU nhanh hơn, nhưng cắt phần CPU lặp trên 120 prompt dài.
+
+### 0.3.2 Queue: waiting → scheduled
+
+| Leaf | Tình trạng trên trace | Flag-level không-hiển-nhiên | Trick / code-level |
+|---|---|---|---|
+| Q1 hết seat `max_num_seqs` | v31 cố tình để `seqs=10`: TTFT xấu, TBT tốt | Test **v35 seqs=14** và **v36 seqs=16**. Đây là dùng TPOT floor slack, không phải tăng bừa. v27 seqs=20 đã quá tay: TBT 22 | Patch tách `max_decode_seqs` và `max_prefill_seqs`: decode giữ ~10 để TBT 16-20, nhưng cho prefill-only chunks chen thêm |
+| Q2 token budget | `2174` được chọn vì `2*1072=2144` + 30 headroom | `2208/2304` là sweep hợp lý hơn `2144`; `2144` dễ rơi về 1 block khi decode chen vào | Patch block-aware budget: chỉ admit prefill nếu `budget_after_decode >= 2144`; nếu không thì skip prefill để bảo vệ decode |
+| Q3 KV block | v31 không failed/preempt, KV không phải bottleneck chính | `max-model-len=32768` (v33) có thể giảm reserved/profile pressure; max prompt+output ~27.6k nên đủ | Nếu build custom: profile KV với max_len thật của trace, không dùng headroom 48k |
+| Q5 HOL trong waiting | 20 request trong burst có prefix chung; FCFS làm request sau chờ | `priority` chỉ có ích nếu request gửi priority, trace không có | Group-aware scheduling: nhận diện 20 request cùng round/prefix, schedule common prefix trước, rồi fan-out |
+
+**Kết luận Queue:** public flags chỉ biểu diễn trade-off thô seat/budget. Đòn sâu là **hai-làn decode/prefill**: decode lane được bảo vệ để TBT không vượt 20ms; prefill lane chỉ chạy khi còn đúng 2-block budget.
+
+### 0.3.3 Prefill: scheduled → first token
+
+| Leaf | Tình trạng trên trace | Flag-level | Trick / code-level |
+|---|---|---|---|
+| P1 số chunk | FP8-KV/Mamba tạo block ~1072; 2-block chunk là sweet spot đã đo | Giữ quanh `2174-2304`; không dùng threshold 256; không bật partial prefill default vì threshold tự động `0.04*48000=1920 < 2144` | Patch scheduler để threshold/chunk luôn là bội số block, ưu tiên 2 block; không để chunk nhỏ lẻ |
+| P2 decode tranh budget | Running decode được schedule trước waiting prefill | `seqs=14/16` dùng slack nhưng phải giữ TBT<=20 | Two-lane scheduler: tính decode trước, sau đó nếu budget còn >=2144 mới chạy prefill; không để prefill kéo decode step quá dài |
+| P3 prefix cache hit round 2-6 | Trace có prefix continuity, nhưng overlap 5s có thể khiến cache chưa kịp sẵn | `prefix-caching-hash-algo=xxhash` có thể giảm hash CPU nhẹ; không phải lever lớn | **Prefix priming**: trước benchmark, prefill system prompt/common prefix để round1 không tính 20 lần. Nếu luật không cho extra request, patch startup prewarm từ file token ids trước khi health ready |
+| P3 in-flight duplicate prefix | 20 request round1 cùng system prompt; cache chưa có khi cùng burst | Không có public flag đủ mạnh | **In-flight prefix dedup/promise**: request B thấy prefix đang được request A tính thì chờ block promise thay vì tự tính lại. Khi A commit blocks, B ref-count/share blocks rồi chỉ tính suffix user |
+| P4/P5 GPU prefill compute | Round1 cold 258,984 token không né được nếu không priming/dedup | GDN FlashInfer đã là best measured; FP8 obvious đã bật | Kernel-level frontier: custom GDN/attention kernel hoặc true common-prefix prefill fanout. Public flags gần hết dư địa |
+
+**Kết luận Prefill:** đòn lớn nhất không phải thêm flag, mà là **không tính lặp common system prefix trong burst 1**. Với trace này system prompt là phần lớn của 12.9k token round1; nếu 20 request cùng tính lại, Queue và Prefill cùng nổ.
+
+### 0.3.4 Residual_out: first token → client sees token
+
+| Leaf | Tình trạng | Action |
+|---|---|---|
+| B1 core→frontend ZMQ | Nhỏ, token đầu payload bé | Không tối ưu trước |
+| B2 detokenize token đầu | Nhỏ nhưng nằm trong TTFT client | Chỉ bỏ được nếu scorer/client nhận token ids; nếu cần text thì giữ tokenizer |
+| B3 streaming HTTP | `stream_interval>1` gửi token đầu vẫn ngay, nhưng token sau bị gộp | Không dùng cho scorer đo TPOT streaming; có thể làm TBT client nhìn xấu theo cụm |
+
+**Kết luận Residual_out:** không phải mặt trận chính. Đừng đổi `stream_interval` để “tăng throughput” nếu metric là inter-token client.
+
+### 0.3.5 TPOT/decode
+
+| Leaf | Tình trạng v31 | Action |
+|---|---|---|
+| T1 scheduler CPU | v17 async từng giảm 1ms nhưng net loss ở regime cũ | v34 cô lập async trên v31; chỉ giữ nếu TBT 16→15 mà TTFT/accuracy không xấu |
+| T3/T4 decode memory bandwidth | v31 TBT 16 đã dưới floor 20 | Không cần giảm TBT nữa; dùng slack để giảm Queue/TTFT |
+| T5 sampling/logprobs | Trace `temperature=0`, không cần logprobs | Đảm bảo không bật logprobs/structured output/reasoning parser |
+| T8 output per token | `stream_interval` có thể giảm CPU nhưng hại TPOT client | Không dùng |
+
+---
+
 ## 1. Sơ đồ đường đi 1 request (v0.24.0, chế độ AsyncLLM multiprocess mặc định)
 
 ```
@@ -230,6 +307,19 @@ dài bị chẻ nhiều chunk qua **nhiều step**, và token đầu chỉ ra sa
 | **P2. Tranh chấp với decode** | budget bị running decode ăn trước ⇒ chunk prefill nhỏ đi ⇒ nhiều step hơn | vòng running trước waiting [scheduler.py:431](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L431) | Cùng cờ Q2. Đánh đổi: prefill nhanh (ít contention) ⇔ TPOT của batch hiện tại. |
 | **P3. Prefix-cache hit** | token đã cache ⇒ `num_computed_tokens` bỏ qua ⇒ ít token phải tính ⇒ prefill ngắn | `get_computed_blocks` [scheduler.py:710](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L710); `PrefillStats.set` [stats.py:260-273](../vendor/vllm-0.24.0/vllm/v1/metrics/stats.py#L260-L273) | `--enable-prefix-caching` (+`--prefix-caching-hash-algo`). Vàng nếu prompt có prefix chung (system prompt). |
 
+> **⚠️ Cạm bẫy V0→V1: `--max-num-partial-prefills` & `--max-long-partial-prefills` là NO-OP trong v0.24.0.**
+> Grep toàn repo: 2 cờ này **không được đọc ở bất kỳ đâu lúc runtime** — chỉ `long_prefill_token_threshold`
+> được scheduler dùng ([scheduler.py:468](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L468),[:797](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L797)).
+> Chúng là khái niệm của scheduler **V0**; V1 chuyển sang thuần token-budget (comment [scheduler.py:390-399](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L390-L399):
+> *"There's no 'decoding phase' nor 'prefill phase'"*).
+>
+> **Hệ quả (trả lời trực tiếp câu "budget 2500, A prefill nốt 500, B có vào 2000 dư không?"):** CÓ.
+> Số prompt cùng prefill trong 1 step **KHÔNG** bị `max_num_partial_prefills=1` giới hạn — điều kiện admit ở
+> vòng waiting ([scheduler.py:629-631](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L629-L631)) chỉ là
+> `token_budget > 0` **và** `len(running) < max_num_seqs` **và** còn KV block. Tại iteration N: vòng running cấp
+> nốt 500 cho A (budget 2500→2000), rồi vòng waiting admit B với `min(prompt_B, 2000)` token — **A và B cùng
+> prefill trong một batch**. Chặn "bao nhiêu prompt cùng prefill" thực chất = `max_num_batched_tokens` + `max_num_seqs` + KV.
+
 ### 4.2 Tầng compute — thời gian 1 step prefill (GPU)
 
 Phase con lộ qua marker profiler của chính vLLM trong `execute_model`
@@ -314,7 +404,7 @@ per-request thay vì chỉ histogram Prometheus:
 1. **`--async-scheduling`** — giảm TPOT gần như free (giấu CPU sched). Bật đầu tiên.
 2. **Cudagraph ON** (đừng `--enforce-eager`) + `--cudagraph-capture-sizes` phủ batch decode — nền TPOT.
 3. **`--speculative-config` (ngram trước, eagle nếu có draft)** — đòn TPOT lớn nhất còn lại; đo acceptance rate.
-4. **`--kv-cache-dtype fp8` + `--quantization fp8`** — giảm cả 4 interval (byte weight/KV nhỏ hơn).
+4. **`--kv-cache-dtype fp8` + `--quantization fp8`** — ⚠️ **KHÔNG giảm cả 4 interval** (xem §9: thực đo L40S cho thấy fp8 **hại TTFT qua QUEUE**, chỉ lợi decode/TPOT + tiết kiệm KV).
 5. **Cân `--max-num-seqs` & `--max-num-batched-tokens`** theo profiler: nếu Queue lớn ⇒ nới; nếu preempt-spike
    (T9) ⇒ siết + `--gpu-memory-utilization` ↑.
 6. **`--enable-prefix-caching`** nếu trace có prefix chung — cắt thẳng Prefill (P3) + Queue (Q3).
@@ -324,3 +414,82 @@ per-request thay vì chỉ histogram Prometheus:
 
 > Mọi con số cụ thể (chunk size tối ưu, acceptance rate, batch sweet-spot) phải lấy từ **profiler + trace thật**
 > trên GPU, không đoán. §7 là cách lấy chúng.
+
+---
+
+## 9. CẬP NHẬT (bench L40S thực đo, 2026-07) — sửa root-cause fp8 + thêm token-tax & overhead
+
+> Mục §1-§8 phân rã theo interval là đúng. Nhưng §8 xếp `fp8` là "giảm cả 4 interval" — **SAI**.
+> Đo thật (`output/l40s-abfp8-20260712`, `l40s-batchtok-20260712`, `l40s-profile-20260712`) lật lại
+> như dưới. Đồng thời bổ sung 2 thành phần §1-§4 chưa có: **token-tax** và **launch-overhead**.
+
+### 9.0 Trục thứ 2: HAI ĐỒNG HỒ (thiếu ở §4)
+Mọi node compute phải đọc **2 số**:
+- `wall` = đồng hồ thật (cái grader chấm).
+- `gpu_busy` = Σ thời lượng kernel.
+- **`overhead = wall − gpu_busy`** = launch/dispatch CPU + gap giữa kernel. **Đây là node hạng nhất**, và là
+  chỗ chi phí fp8 trên Ada ẩn nấp (GPU-busy KHÔNG thấy nó).
+
+### 9.1 Prefill mở rộng — thêm T3c (token-tax) và T3d (overhead)
+```
+Prefill (wall = gpu_busy + overhead)
+├─ T3a own_compute vs interleave        (patch_sched_trace pref_ids)
+├─ T3b GPU-BUSY compute (X) theo layer-group:
+│    ├─ GEMM: Full-attn(qkv/o_proj,6 lớp) + GDN(in/out_proj,18 lớp) + MLP(gate/up/down) ← ~72% prefill
+│    ├─ GDN-core (chunk_gated_delta_rule + causal_conv1d_fwd)   ← KHÔNG quantize
+│    ├─ FullAttn kernel (flashinfer BatchPrefill)               ← KHÔNG quantize
+│    └─ KV_write / norm / rope
+├─ T3c TOKEN-TAX (Y) — CHỈ fp8:  quantize-activation mỗi Linear + cast BF16↔FP8 ở ranh giới đảo
+└─ T3d LAUNCH/OVERHEAD (wall−busy): dispatch nhiều kernel hơn + nhiều chunk hơn (block-align 1072) +
+     gap (Ada KHÔNG có DeepGEMM để fuse quant → gap lộ ra thành wall)
+```
+Vì sao Ada không vào fast path: `support_deep_gemm` chỉ Hopper/Blackwell
+([cuda.py:663](../vendor/vllm-0.24.0/vllm/platforms/cuda.py#L663)); GDN prefill FlashInfer cũng chỉ SM90/Blackwell
+([qwen_gdn_linear_attn.py:150](../vendor/vllm-0.24.0/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L150)).
+`--quantization=fp8` là **online** (quantize weight lúc load + dynamic activation lúc chạy):
+[online/fp8.py:105](../vendor/vllm-0.24.0/vllm/model_executor/layers/quantization/online/fp8.py#L105).
+
+### 9.2 ROOT-CAUSE fp8 (sửa §8) — lỗ TTFT qua QUEUE, KHÔNG phải prefill
+Bằng chứng per-request (mean 3 rep), turn0 từng user — cột **queue fp8 > noquant ở CẢ 20 user, đơn điệu**:
+
+| user cuối burst | queue noquant | queue fp8 | Δ |
+|---|---|---|---|
+| user1 | 115 | 194 | +79 |
+| user10 | 1297 | 1661 | +364 |
+| user19 | 2596 | 3296 | **+700** |
+
+- fp8 lỗ TTFT là do `kv-cache=fp8` ép **mamba block-align = 1072** (bf16 = 544):
+  [scheduler.py `_mamba_block_aligned_split`](../vendor/vllm-0.24.0/vllm/v1/core/sched/scheduler.py#L330).
+  Ở budget 2048: 1072 lát ra **1 block** (phí 976, kẹt **1-lane** `n_prefilling=1`); 544 lát **3 block=1632** (2-lane).
+- **KHÔNG phải block-align tồi vốn dĩ** — chỉ tồi khi budget=2048. Đo throughput thật:
+  `fp8@b3216 → 2144 tok/iter (2 block, 2-lane) > noquant@b2048 → 1632 tok/iter`. Chỉnh budget là hết kẹt.
+  (b2144 vô dụng: khít 2×1072, 1 token decode rớt xuống 1 block.)
+- Nhưng queue fp8@3216 (467ms) vẫn chỉ **≈** noquant@2048 (440ms) — vì **token-tax kéo tok/giây fp8 về ngang**.
+  → "sêm sêm, thế quantize làm gì" trên L40S là đúng.
+
+### 9.3 Prefill COMPUTE của fp8 KHÔNG chậm — user0/turn0 là OUTLIER (không phải cold-start)
+- Chuẩn hóa theo **uncached-token**: 18/20 user turn0 fp8 prefill **nhanh hơn** noquant; mọi turn-aggregate fp8 nhanh hơn.
+- Chỉ **user0** (unc=12947, request đầu, 1 chunk lớn) fp8 chậm (30.6 vs 22.6 µs/utok) — đây là chỗ cả narrative
+  cũ bị dựng lên. Trace code: `apply()` fp8 **không** có lazy/autotune/first-call
+  ([online/fp8.py:348](../vendor/vllm-0.24.0/vllm/model_executor/layers/quantization/online/fp8.py#L348);
+  grep `autotune|lazy|cache` trong `scaled_mm/cutlass.py` = rỗng) → **KHÔNG có cold-start fp8**. Chậm ổn định qua
+  mọi budget (396@2048, 386@3216) ⇒ là **per-token tax/overhead**, không phải one-time.
+- GPU-busy trace (interleave-free) xác nhận fp8 GEMM nhanh hơn (16.9 vs 20.7ms) — nên phần fp8-slower ở wall là
+  **overhead (T3d) + tax (T3c)**, không phải compute (X).
+
+### 9.4 Decode/TPOT — nơi fp8 THẮNG (khớp Tầng 5 §profiler)
+`gpu_busy` decode per-step: fp8 **5.7ms** vs noquant **7.3ms** (−22%), dồn vào **GEMM weight-read** (fp8 nửa byte).
+KV-fp8 tiết kiệm memory + băng thông đọc KV. Đây là lý do trên **H200-MIG 18GB (memory-bind)** fp8 thắng cả TTFT
+(giữ đủ lane, ít preempt) — ngược L40S (VRAM dư, không bind).
+
+### 9.5 Công cụ đo (userspace, KHÔNG sudo — GPU thuê không có root)
+| script | đo | ghi chú no-sudo |
+|---|---|---|
+| `scripts/gpu-l40s-bench/measure_preflight.sh` | check + **log clock/nhiệt/power 1s** | không lock được clock → log để loại mẫu throttle |
+| `scripts/gpu-l40s-bench/profile_compute_ab.py` | wall-sạch (perf_counter) + trace gpu_busy, A/B, prefill+decode | `VLLM_ENABLE_V1_MULTIPROCESSING=0` cho NVTX hook |
+| `scripts/gpu-l40s-bench/parse_compute.py` | T3b layer-group + T3c tax + **T3d overhead=wall−busy** + D1 | offline thuần Python |
+| `scripts/gpu-l40s-bench/nsys_compute.sh` | launch-gap sạch (tùy chọn) | `--sample=none --cpuctxsw=none` (không cần root) |
+| `scripts/gpu-l40s-bench/run_compute_breakdown.sh` | orchestrator tầng 4-5 | chạy sau `run_v28_baseline.sh` |
+
+> Chưa đo sạch: X-vs-Y ở đúng shape 12947-token (GPU-busy hiện có ở 1040-token, ngoại suy có thể sai). `nsys`
+> hoặc `wall−busy` ở đúng shape (script trên) sẽ chốt. **Mọi A/B phải trong CÙNG 1 lần thuê GPU.**

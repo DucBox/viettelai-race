@@ -36,14 +36,18 @@ echo
 _pre_env_declare="$(declare -p $(compgen -e) 2>/dev/null || true)"
 if [[ -f serve/.env ]]; then set -a; source serve/.env; set +a; fi
 eval "$_pre_env_declare"
-IMAGE="${IMAGE:-vllm/vllm-openai:v0.22.1}"
+# IMAGE: must be a vLLM build that supports model_type=lfm2 (LFM2.5). The old
+# Qwen-era v0.22.1 tag may NOT — verify on the GPU box before trusting it.
+IMAGE="${IMAGE:-vllm/vllm-openai:latest}"
 GPU_ID="${GPU_ID:-0}"
-MODEL_DIR="${MODEL_DIR:-./models/qwen3.5-2b}"
-MODEL_PATH="${MODEL_PATH:-/models/qwen3.5-2b}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MODEL_DIR="${MODEL_DIR:-./models/lfm2.5-1.2b}"
+MODEL_PATH="${MODEL_PATH:-/models/lfm2.5-1.2b}"
+# Workload is ~4k input + ≤200 out (see docs); 8192 leaves margin without
+# over-reserving KV. Model itself supports up to 128k.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.5-2b}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-lfm2.5-1.2b}"
 # MODEL_DIR in .env is relative to serve/ — resolve to an absolute path either
 # way (needed for docker run's -v, and just as correct as the vllm serve arg
 # in native mode).
@@ -124,9 +128,9 @@ else
     full_log() { ( cd serve && "${COMPOSE[@]}" logs --no-log-prefix vllm ) 2>/dev/null; }
   else
     echo ">> No compose CLI found (v2 plugin or v1 binary) — using plain 'docker run' instead."
-    docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
+    docker rm -f vllm-lfm2 >/dev/null 2>&1 || true
 
-    RUN_COMMON=(-d --name vllm-qwen35 --ipc=host -p 8000:8000
+    RUN_COMMON=(-d --name vllm-lfm2 --ipc=host -p 8000:8000
       -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO
       -v "$MODEL_DIR_ABS:$MODEL_PATH:ro")
     VLLM_ARGS=("$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
@@ -146,7 +150,7 @@ else
       if echo "$GPU_ERR" | grep -qi "cdi\|gpu vendor"; then
         echo ">> '--gpus' failed via CDI vendor discovery (common on Docker-in-Docker / k8s pods)."
         echo ">> Attempt 2/2: classic --runtime=nvidia + NVIDIA_VISIBLE_DEVICES ..."
-        docker rm -f vllm-qwen35 >/dev/null 2>&1 || true
+        docker rm -f vllm-lfm2 >/dev/null 2>&1 || true
         docker run "${RUN_COMMON[@]}" \
           --runtime=nvidia \
           -e NVIDIA_VISIBLE_DEVICES="$GPU_ID" \
@@ -158,10 +162,10 @@ else
         exit 1
       fi
     fi
-    LOGS_CMD="docker logs -f vllm-qwen35"
-    is_alive() { [[ -n "$(docker ps -q --filter name=vllm-qwen35 2>/dev/null)" ]]; }
-    tail_log() { docker logs --tail 40 vllm-qwen35 2>&1; }
-    full_log() { docker logs vllm-qwen35 2>&1; }
+    LOGS_CMD="docker logs -f vllm-lfm2"
+    is_alive() { [[ -n "$(docker ps -q --filter name=vllm-lfm2 2>/dev/null)" ]]; }
+    tail_log() { docker logs --tail 40 vllm-lfm2 2>&1; }
+    full_log() { docker logs vllm-lfm2 2>&1; }
   fi
 fi
 

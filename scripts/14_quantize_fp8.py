@@ -13,30 +13,23 @@
                                                  # CALIBRATED on the round-1 trace
                                                  # (an A/B candidate vs dynamic)
 
-RECIPE — NOT a guess, copied from a REAL published checkpoint of the SAME
-model family: RedHatAI/Qwen3.5-4B-FP8-dynamic (config.json read directly,
-see docs/llm-compressor-quantization-guide.md). That checkpoint's
-quantization_config.ignore, once you collapse the per-layer expansion back to
-patterns, is exactly:
+RECIPE — tuned for SPEED-FIRST serving on Qwen3.5-2B, not for benchmark-paper
+accuracy recovery. The published RedHatAI recipe for the same model family
+keeps the ENTIRE Gated DeltaNet mixer in BF16 via:
 
     ignore = ["lm_head", "re:.*embed_tokens$", "re:^mtp.*", "re:.*visual.*", "re:.*linear_attn.*"]
 
-i.e. the ENTIRE Gated DeltaNet mixer (in_proj_qkv/in_proj_z/out_proj/in_proj_a/
-in_proj_b — not just the tiny gates) stays BF16, along with the tied lm_head,
-the MTP speculative head, and the vision tower. Only the full-attention
-self_attn.{q,k,v,o}_proj and every mlp.{gate,up,down}_proj (both layer types)
-get FP8'd. Real published accuracy for that recipe on the 4B/9B siblings://
-99.5-100.3% recovery vs BF16 across GSM8k-Platinum/MMLU-Pro/Math500/AIME —
-see docs/llm-compressor-quantization-guide.md for the numbers and sourcing.
+That is the conservative "don't touch GDN" choice. For TTFT/TPOT on Hopper we
+want the large GDN projections (`in_proj_qkv`, `in_proj_z`, `out_proj`) to go
+FP8 as well, because those are just big GEMMs and do have native fast paths in
+vLLM. The only GDN Linear modules still ignored here are the tiny gate
+projections `in_proj_a/_b` (shape [16, 2048]) plus the tied `lm_head`, MTP
+head, and vision tower. `conv1d`, `A_log`, `dt_bias`, and norms are not
+matched anyway because the recipe targets `Linear` only.
 
-This script does NOT hand-list layer indices (unlike the published
-checkpoint's expanded config.json) — a blanket "re:.*linear_attn.*" matches
-every GDN layer regardless of how many there are (24 here vs 32 on the 4B),
-so it doesn't need to know num_hidden_layers or which indices are GDN vs
-full-attention. It DOES loop over config.text_config.layer_types to PRINT a
-verification table (real param counts ignored vs quantized) before running —
-so a config mismatch (wrong model, wrong arch) fails loud before burning GPU
-time, instead of silently quantizing the wrong thing.
+This script does NOT hand-list layer indices — it uses regexes, then prints a
+real param-accounting table before running so a config/name mismatch fails
+loud before burning GPU time.
 
 CALIBRATION (--calib) — read this before assuming calib = better:
   The DEFAULT path is FP8_DYNAMIC, which is DATA-FREE. FP8 weight scales are
@@ -96,19 +89,39 @@ def h(title):
     print("\n" + "=" * 72 + f"\n{title}\n" + "=" * 72)
 
 
-# Patterns straight from the RedHatAI/Qwen3.5-*-FP8-dynamic recipe (see module
-# docstring). Order doesn't matter — QuantizationModifier ORs them.
+# Speed-first ignore list: keep only layers that are either tied / irrelevant
+# for the text-serving path, or too tiny to matter for throughput.
 IGNORE = [
-    "lm_head",           # tied to embed_tokens (nn.Embedding — never matches
-                         # targets="Linear" anyway, listed for clarity/safety)
-    "re:.*embed_tokens$",  # same tied tensor, listed for parity with the real
-                           # RedHatAI recipe.yaml (belt-and-suspenders: also
-                           # nn.Embedding, so this never matches targets="Linear"
-                           # either — harmless either way)
-    "re:^mtp.*",         # speculative-decode draft head, 2.7% of params
-    "re:.*visual.*",     # vision tower, dead weight for the text-only trace
-    "re:.*linear_attn.*",  # ENTIRE Gated DeltaNet mixer — see module docstring
+    "lm_head",  # tied to embed_tokens; keep BF16 to avoid shared-weight surprises
+    "re:.*embed_tokens$",  # nn.Embedding, listed for tied-weight clarity/safety
+    "re:^mtp.*",  # speculative-decode draft head; irrelevant to the target path
+    "re:.*visual.*",  # vision tower; dead weight for the text-only trace
+    # Tiny GDN gates [16, 2048]: negligible speed win, easiest BF16 keep.
+    "re:.*linear_attn\\.in_proj_[ab]$",
 ]
+
+# Selectable ignore presets (--ignore-preset / IGNORE_PRESET env / QUANT_IGNORE):
+#   default      : the list above (keeps lm_head + tiny GDN gates + visual + mtp BF16).
+#   match-online : the EXACT layer set vLLM's on-the-fly --quantization=fp8 touches.
+#                  Verified against vendor/vllm-0.24.0: online fp8 quantizes every
+#                  LinearBase built WITH a quant_config — INCLUDING the GDN gates
+#                  (in_proj_ba) — and skips lm_head (VocabParallelEmbedding, not
+#                  LinearBase) + conv1d (ColumnParallelLinear built without
+#                  quant_config). So this = default MINUS the gate line (gates now
+#                  go FP8). Use it to isolate the static-vs-dynamic activation axis
+#                  against on-the-fly fp8 with an IDENTICAL served-layer set.
+#   none         : quantize every Linear, incl. the tied lm_head (aggressive A/B).
+IGNORE_PRESETS = {
+    "default": IGNORE,
+    "match-online": [
+        "lm_head",
+        "re:.*embed_tokens$",
+        "re:^mtp.*",
+        "re:.*visual.*",
+        "re:.*conv1d$",  # HF conv1d is Conv1d (not matched by targets=Linear); listed for clarity
+    ],
+    "none": [],
+}
 
 # Files transformers' save_pretrained() calls don't reliably re-emit (they
 # belong to the processor/chat layer, untouched by quantization) — copy
@@ -272,10 +285,13 @@ def preflight_report(model, cfg):
     h("PARAM ACCOUNTING (real, from the loaded model — not hand math)")
     ignored_params, quantized_params, other_params = 0, 0, 0
     n_linear_attn_ignored = 0
+    n_linear_attn_total = 0
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
         n = sum(p.numel() for p in mod.parameters())
+        if "linear_attn" in name:
+            n_linear_attn_total += 1
         if matches_ignore(name, IGNORE):
             ignored_params += n
             if "linear_attn" in name:
@@ -285,11 +301,13 @@ def preflight_report(model, cfg):
     total = ignored_params + quantized_params
     print(f"  Linear params quantized (FP8) : {quantized_params/1e9:8.3f} B  ({100*quantized_params/total:5.1f}%)")
     print(f"  Linear params ignored (BF16)  : {ignored_params/1e9:8.3f} B  ({100*ignored_params/total:5.1f}%)")
-    print(f"  linear_attn Linear modules ignored: {n_linear_attn_ignored}  "
-          f"(expect 18 layers x 5 = 90: in_proj_qkv/in_proj_z/in_proj_a/in_proj_b/out_proj "
-          f"— in_proj_a/_b ARE nn.Linear too, tiny [16,2048], swept in by the same blanket regex)")
-    if n_linear_attn_ignored == 0:
-        sys.exit("!! 0 linear_attn modules matched — module names don't look like expected "
+    print(f"  linear_attn Linear modules: {n_linear_attn_total} total, {n_linear_attn_ignored} kept BF16 "
+          f"(default preset keeps 36 tiny gates; match-online/none keep 0)")
+    # Sanity: the model must actually expose linear_attn Linear modules, else we
+    # loaded the wrong thing / wrong loader class. Check TOTAL (not ignored) so it
+    # holds for every preset — match-online/none legitimately ignore 0 of them.
+    if n_linear_attn_total == 0:
+        sys.exit("!! 0 linear_attn Linear modules found — module names don't look like expected "
                  "(model.language_model.layers.N.linear_attn.*). Wrong model or wrong loader class. Aborting.")
     return quantized_params, ignored_params
 
@@ -419,7 +437,20 @@ def main():
                      help="Cap on calibration samples (0 = every record; GPQA-diamond is 198, trace is 120).")
     ap.add_argument("--max-seq-len", type=int, default=int(os.environ.get("MAX_SEQ_LEN", "8192")),
                      help="Truncate each calibration prompt to this many tokens (only with --calib).")
+    ap.add_argument("--ignore-preset", choices=list(IGNORE_PRESETS),
+                     default=os.environ.get("IGNORE_PRESET", "default"),
+                     help="Which quantize IGNORE list to use (see IGNORE_PRESETS). "
+                          "'default' keeps lm_head/GDN gates/visual/mtp BF16. 'match-online' "
+                          "mirrors vLLM online --quantization=fp8's layer set (quantizes the GDN "
+                          "gates, keeps lm_head+conv1d BF16). 'none' quantizes every Linear "
+                          "including the tied lm_head.")
     args = ap.parse_args()
+
+    global IGNORE
+    IGNORE = IGNORE_PRESETS[args.ignore_preset]
+    print(f">> ignore-preset = {args.ignore_preset}  ({len(IGNORE)} ignore entries)")
+    if args.ignore_preset == "none":
+        print("!! IGNORE=[] — tied lm_head + sensitive GDN gates go FP8; watch the sanity output.")
 
     model_dir = args.model_dir
     out_dir = args.out or (model_dir.rstrip("/") +
