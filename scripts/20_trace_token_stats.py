@@ -9,8 +9,7 @@ Chạy:
 Cần: transformers + tokenizers trong .venv, và serve/models/qwen3.5-2b/ (weights
 + tokenizer + chat_template.jinja) đã có sẵn tại chỗ.
 
-Kết quả đã ghi lại (2026-07-10) trong docs/trace-round1-token-stats.md — file này
-là nguồn tái tạo, chạy lại nếu trace hoặc tokenizer thay đổi.
+Đây là script tái tạo. Chạy lại nếu trace hoặc tokenizer thay đổi.
 """
 import json
 import statistics as stats

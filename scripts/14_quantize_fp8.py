@@ -3,9 +3,7 @@
 
     source .venv-quantize/bin/activate      # repo-root venv with llmcompressor +
                                              # compressed-tensors + transformers-from-source
-                                             # already installed (see
-                                             # docs/llm-compressor-quantization-guide.md
-                                             # §B for the exact pins this needs)
+                                             # already installed
     python3 scripts/14_quantize_fp8.py
     python3 scripts/14_quantize_fp8.py --model-dir serve/models/qwen3.5-2b \
         --out serve/models/qwen3.5-2b-fp8-dynamic

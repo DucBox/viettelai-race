@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quantize Qwen3.5-2B to INT4 AWQ (compressed-tensors) via llm-compressor.
 
-    source .venv-quantize/bin/activate      # see docs/llm-compressor-quantization-guide.md
+    source .venv-quantize/bin/activate
     python3 scripts/15_quantize_awq.py
     python3 scripts/15_quantize_awq.py --model-dir serve/models/qwen3.5-2b \
         --out serve/models/qwen3.5-2b-awq-int4

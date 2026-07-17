@@ -6,8 +6,8 @@ metric that matters — **before** touching the production server or any optimiz
 > ℹ️ **Ruleset changed 2026-07-16.** The competition model is now
 > **LFM2.5-1.2B-Instruct** (was Qwen3.5-2B). LFM2.5 is a hybrid *short-range
 > convolution + GQA attention* model (16 layers = 10 conv + 6 attention, 1.17B,
-> text-only). Everything about the old Qwen setup (docs under `docs/vllm-v0.22.1*`,
-> `docs/vllm-v0.24.0*`, `scripts/gpu-l40s-bench/`) is kept only as **reference**.
+> text-only). Old Qwen-specific working notes were trimmed from `docs/` to keep
+> the repo focused on the current LFM2 track.
 
 > ⚠️ **Runs on a Linux + NVIDIA GPU box only.** This kit does not work on macOS /
 > Apple Silicon: vLLM needs CUDA. Use a dev GPU for this step (a cloud L4 / A10 /
@@ -65,9 +65,11 @@ data/
 aiperf/
   vendored clone of github.com/ai-dynamo/aiperf — source + docs reference (gitignored)
 docs/
-  VIETTEL AI RACE.pdf              the problem statement
-  qwen35-architecture.html        (REFERENCE, old Qwen model) architecture deep-dive
-  trace-round1-data-description.md  schema + structure of the trace files
+  VIETTEL AI RACE.pdf                         the original problem statement
+  viettel-ai-race-btc-update-2026-07-16.md   BTC ruleset delta vs the original PDF
+  aiperf-metrics-guide.md                    how to read TTFT / ITL / server metrics
+  vllm-0.24-lfm2-cpu-checklist-and-mrv2-porting.md
+                                             current LFM2 speed checklist + MRV2 ideas
 ```
 
 ## Running it
