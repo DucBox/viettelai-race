@@ -68,6 +68,12 @@ docs/
   VIETTEL AI RACE.pdf                         the original problem statement
   viettel-ai-race-btc-update-2026-07-16.md   BTC ruleset delta vs the original PDF
   aiperf-metrics-guide.md                    how to read TTFT / ITL / server metrics
+  gpu-setup-checklist.md                     L40S/H200 bring-up checklist, now kept as reference
+  bench-toolkit-va-tang-metric.md           bench/metric layering notes, kept as reference
+  vllm-flags-reference.md                    retained vLLM flag reference
+  vllm-0.24-speed-checklist-verified-2026-07-16.md
+                                             retained vLLM 0.24 speed notes
+  vllm_v0.24.0_all_flags_deep_trace.md       retained deep flag trace for vLLM 0.24
   vllm-0.24-lfm2-cpu-checklist-and-mrv2-porting.md
                                              current LFM2 speed checklist + MRV2 ideas
 ```
