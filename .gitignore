@@ -43,6 +43,7 @@ serve/vllm.log
 
 # Submission compose files (reference the pushed Docker Hub image tag) — local only
 /submit/
+/submit_r2/
 
 # Local bench outputs (traces, replay json, profiler dumps) — regenerated per GPU run
 /output/
